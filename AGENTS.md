@@ -31,6 +31,7 @@
 - Update user-facing documentation when behavior, public APIs, examples, or setup steps change.
 - Keep public Rust docs concise and idiomatic. For public items, include canonical sections such as `# Examples`, `# Errors`, `# Panics`, or `# Safety` when they apply.
 - Prefer updating the closest existing documentation file instead of creating duplicate docs.
+- When a roadmap or milestone task is completed, update the corresponding planning document and mark that item with the `[Implemented]` prefix so progress is not lost.
 
 ## Repository-specific notes
 - Pingora is primarily a library workspace. Be conservative about adding application-specific conventions that do not fit library crates, examples, or benches.
