@@ -27,9 +27,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing upstream model: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
-- Existing UDP design note: `/home/alekitto/projects/pingora/docs/codex/udp-upstream-model.md`
-- Implemented UDP upstream peer type: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
+- Existing upstream model: `pingora-core/src/upstreams/peer.rs`
+- Existing UDP design note: `docs/codex/udp-upstream-model.md`
+- Implemented UDP upstream peer type: `pingora-core/src/upstreams/peer.rs`
 
 ### [Implemented] Task 2.2
 
@@ -47,9 +47,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing balancing crate: `/home/alekitto/projects/pingora/pingora-load-balancing`
-- Existing datagram flow key: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
-- Implemented UDP backend selection layer: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs`
+- Existing balancing crate: `pingora-load-balancing`
+- Existing datagram flow key: `pingora-core/src/protocols/l4/datagram.rs`
+- Implemented UDP backend selection layer: `pingora-core/src/upstreams/udp.rs`
 
 ### [Implemented] Task 2.3
 
@@ -67,9 +67,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing flow-key model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
-- Existing balancing model note: `/home/alekitto/projects/pingora/docs/codex/udp-balancing-model.md`
-- Implemented UDP flow table: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs`
+- Existing flow-key model: `pingora-core/src/protocols/l4/datagram.rs`
+- Existing balancing model note: `docs/codex/udp-balancing-model.md`
+- Implemented UDP flow table: `pingora-core/src/upstreams/udp.rs`
 
 ### [Implemented] Task 2.4
 
@@ -87,9 +87,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Datagram service entrypoint: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
-- UDP listener and packet model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
-- Implemented UDP forwarding app: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Datagram service entrypoint: `pingora-core/src/services/datagram.rs`
+- UDP listener and packet model: `pingora-core/src/protocols/l4/datagram.rs`
+- Implemented UDP forwarding app: `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 2.5
 
@@ -107,9 +107,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing health-check patterns: `/home/alekitto/projects/pingora/pingora-load-balancing`
-- Existing UDP upstream model note: `/home/alekitto/projects/pingora/docs/codex/udp-upstream-model.md`
-- Implemented UDP backend availability and remap: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs` and `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Existing health-check patterns: `pingora-load-balancing`
+- Existing UDP upstream model note: `docs/codex/udp-upstream-model.md`
+- Implemented UDP backend availability and remap: `pingora-core/src/upstreams/udp.rs` and `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 2.6
 
@@ -127,10 +127,10 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing example layout: `/home/alekitto/projects/pingora/pingora-core/examples`
-- Existing UDP echo example: `/home/alekitto/projects/pingora/pingora-core/examples/udp_echo.rs`
-- UDP load-balancer example: `/home/alekitto/projects/pingora/pingora-core/examples/udp_lb.rs`
-- DNS-like UDP routing example: `/home/alekitto/projects/pingora/pingora-core/examples/udp_dns_like.rs`
+- Existing example layout: `pingora-core/examples`
+- Existing UDP echo example: `pingora-core/examples/udp_echo.rs`
+- UDP load-balancer example: `pingora-core/examples/udp_lb.rs`
+- DNS-like UDP routing example: `pingora-core/examples/udp_dns_like.rs`
 
 ## Milestone 3
 
@@ -150,9 +150,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- UDP service observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- UDP service observability: `pingora-core/src/services/datagram.rs`
 - Planned flow table from Milestone 2
-- Implemented flow lifecycle observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs` and `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs`
+- Implemented flow lifecycle observability: `pingora-core/src/services/datagram.rs` and `pingora-core/src/upstreams/udp.rs`
 
 ### [Implemented] Task 3.2
 
@@ -171,8 +171,8 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - UDP flow state implementation from Milestone 2
-- Datagram service layer: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
-- Implemented bounded flow table and overload policy: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs` and `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Datagram service layer: `pingora-core/src/services/datagram.rs`
+- Implemented bounded flow table and overload policy: `pingora-core/src/upstreams/udp.rs` and `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 3.3
 
@@ -190,9 +190,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Datagram service module: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Datagram service module: `pingora-core/src/services/datagram.rs`
 - Flow table implementation from Milestone 2
-- Implemented timeout and cleanup options: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Implemented timeout and cleanup options: `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 3.4
 
@@ -210,9 +210,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Datagram buffer model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
-- UDP service layer: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
-- Implemented truncation handling and drop behavior: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs` and `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Datagram buffer model: `pingora-core/src/protocols/l4/datagram.rs`
+- UDP service layer: `pingora-core/src/services/datagram.rs`
+- Implemented truncation handling and drop behavior: `pingora-core/src/protocols/l4/datagram.rs` and `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 3.5
 
@@ -230,9 +230,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing docs area: `/home/alekitto/projects/pingora/docs`
-- Existing Prometheus docs: `/home/alekitto/projects/pingora/docs/user_guide/prom.md`
-- Implemented UDP deployment guide: `/home/alekitto/projects/pingora/docs/user_guide/udp.md`
+- Existing docs area: `docs`
+- Existing Prometheus docs: `docs/user_guide/prom.md`
+- Implemented UDP deployment guide: `docs/user_guide/udp.md`
 
 ## Milestone 4
 
@@ -252,9 +252,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Workspace manifest: `/home/alekitto/projects/pingora/Cargo.toml`
-- QUIC strategy note: `/home/alekitto/projects/pingora/docs/codex/quic-integration-strategy.md`
-- Implemented workspace crate and feature gates: `/home/alekitto/projects/pingora/pingora-quic`, `/home/alekitto/projects/pingora/Cargo.toml`, and `/home/alekitto/projects/pingora/pingora/Cargo.toml`
+- Workspace manifest: `Cargo.toml`
+- QUIC strategy note: `docs/codex/quic-integration-strategy.md`
+- Implemented workspace crate and feature gates: `pingora-quic`, `Cargo.toml`, and `pingora/Cargo.toml`
 
 ### [Implemented] Task 4.2
 
@@ -273,8 +273,8 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - New QUIC crate from Task 4.1
-- QUIC strategy note: `/home/alekitto/projects/pingora/docs/codex/quic-integration-strategy.md`
-- Implemented `tokio-quiche` adapter boundary: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
+- QUIC strategy note: `docs/codex/quic-integration-strategy.md`
+- Implemented `tokio-quiche` adapter boundary: `pingora-quic/src/lib.rs`
 
 ### [Implemented] Task 4.3
 
@@ -294,7 +294,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - UDP service and transport primitives from Milestones 1-3
 - `pingora-quic` crate from Milestone 4
-- Implemented downstream QUIC listener and session tracking: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
+- Implemented downstream QUIC listener and session tracking: `pingora-quic/src/lib.rs`
 
 ### [Implemented] Task 4.4
 
@@ -312,9 +312,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing connector patterns: `/home/alekitto/projects/pingora/pingora-core/src/connectors`
+- Existing connector patterns: `pingora-core/src/connectors`
 - New QUIC crate from Milestone 4
-- Implemented upstream QUIC destination and connector session path: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
+- Implemented upstream QUIC destination and connector session path: `pingora-quic/src/lib.rs`
 
 ### [Implemented] Task 4.5
 
@@ -334,7 +334,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - `pingora-quic` crate from Milestone 4
 - Existing UDP observability patterns in `pingora-core`
-- Implemented QUIC transport lifecycle stats and error reporting: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
+- Implemented QUIC transport lifecycle stats and error reporting: `pingora-quic/src/lib.rs`
 
 ## Milestone 5
 
@@ -354,9 +354,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Proxy crate: `/home/alekitto/projects/pingora/pingora-proxy`
+- Proxy crate: `pingora-proxy`
 - QUIC crate from Milestone 4
-- Implemented HTTP/3 downstream bridge: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
+- Implemented HTTP/3 downstream bridge: `pingora-proxy/src/proxy_h3.rs`
 
 ### [Implemented] Task 5.2
 
@@ -374,9 +374,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Proxy phase system: `/home/alekitto/projects/pingora/pingora-proxy`
-- Existing guide on phases and filters: `/home/alekitto/projects/pingora/docs/user_guide/phase.md`
-- Implemented HTTP/3 compatibility bridge and explicit unsupported cases: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
+- Proxy phase system: `pingora-proxy`
+- Existing guide on phases and filters: `docs/user_guide/phase.md`
+- Implemented HTTP/3 compatibility bridge and explicit unsupported cases: `pingora-proxy/src/proxy_h3.rs`
 
 ### [Implemented] Task 5.3
 
@@ -394,9 +394,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing examples that strip `alt-svc`: `/home/alekitto/projects/pingora/pingora-proxy/examples/gateway.rs`
-- Existing docs mentioning lack of h3: `/home/alekitto/projects/pingora/docs/user_guide/modify_filter.md`
-- Implemented HTTP/3 negotiation policy and `alt-svc` advertisement helpers: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
+- Existing examples that strip `alt-svc`: `pingora-proxy/examples/gateway.rs`
+- Existing docs mentioning lack of h3: `docs/user_guide/modify_filter.md`
+- Implemented HTTP/3 negotiation policy and `alt-svc` advertisement helpers: `pingora-proxy/src/proxy_h3.rs`
 
 ## Milestone 6
 
@@ -418,7 +418,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing upstream peer models in `pingora-core`
 - Proxy upstream selection in `pingora-proxy`
-- Implemented `Http3Peer` and transport selection model: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs` and `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
+- Implemented `Http3Peer` and transport selection model: `pingora-core/src/upstreams/peer.rs` and `pingora-proxy/src/proxy_h3.rs`
 
 ### [Implemented] Task 6.2
 
@@ -436,9 +436,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing pooling code: `/home/alekitto/projects/pingora/pingora-pool`
+- Existing pooling code: `pingora-pool`
 - Existing proxy and upstream connection behavior in `pingora-proxy`
-- Implemented QUIC upstream session pool, idle reuse, and expiration behavior: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
+- Implemented QUIC upstream session pool, idle reuse, and expiration behavior: `pingora-quic/src/lib.rs`
 
 ### [Implemented] Task 6.3
 
@@ -456,9 +456,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing failover docs: `/home/alekitto/projects/pingora/docs/user_guide/failover.md`
+- Existing failover docs: `docs/user_guide/failover.md`
 - Existing proxy retry behavior in `pingora-proxy`
-- Implemented HTTP/3 retry/failover classifier and policy model: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
+- Implemented HTTP/3 retry/failover classifier and policy model: `pingora-proxy/src/proxy_h3.rs`
 
 ## Milestone 7
 
@@ -478,9 +478,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Documentation root: `/home/alekitto/projects/pingora/docs`
-- Existing user guide index: `/home/alekitto/projects/pingora/docs/user_guide/index.md`
-- Implemented HTTP/3 user guide coverage: `/home/alekitto/projects/pingora/docs/user_guide/http3.md`
+- Documentation root: `docs`
+- Existing user guide index: `docs/user_guide/index.md`
+- Implemented HTTP/3 user guide coverage: `docs/user_guide/http3.md`
 
 ### [Implemented] Task 7.2
 
@@ -498,8 +498,8 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Example directories: `/home/alekitto/projects/pingora/pingora-core/examples`, `/home/alekitto/projects/pingora/pingora/examples`, and `/home/alekitto/projects/pingora/pingora-proxy/examples`
-- Implemented HTTP/3 foundation example: `/home/alekitto/projects/pingora/pingora-proxy/examples/http3_proxy.rs`
+- Example directories: `pingora-core/examples`, `pingora/examples`, and `pingora-proxy/examples`
+- Implemented HTTP/3 foundation example: `pingora-proxy/examples/http3_proxy.rs`
 
 ### [Implemented] Task 7.3
 
@@ -519,7 +519,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing benchmark directories across the workspace
 - New UDP and QUIC crates introduced by earlier milestones
-- Implemented focused benches and validation note: `/home/alekitto/projects/pingora/pingora-core/benches/udp_flow_table.rs`, `/home/alekitto/projects/pingora/pingora-quic/benches/upstream_pool.rs`, `/home/alekitto/projects/pingora/pingora-proxy/benches/http3_bridge.rs`, and `/home/alekitto/projects/pingora/docs/codex/udp-http3-validation.md`
+- Implemented focused benches and validation note: `pingora-core/benches/udp_flow_table.rs`, `pingora-quic/benches/upstream_pool.rs`, `pingora-proxy/benches/http3_bridge.rs`, and `docs/codex/udp-http3-validation.md`
 
 ### [Implemented] Task 7.4
 
@@ -537,9 +537,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Server configuration module: `/home/alekitto/projects/pingora/pingora-core/src/server/configuration`
+- Server configuration module: `pingora-core/src/server/configuration`
 - Docs and examples added in previous milestones
-- Implemented builder-style config helpers and aligned examples/docs: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`, `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`, and `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
+- Implemented builder-style config helpers and aligned examples/docs: `pingora-core/src/services/datagram.rs`, `pingora-quic/src/lib.rs`, and `pingora-core/src/upstreams/peer.rs`
 
 ## Suggested delivery order
 

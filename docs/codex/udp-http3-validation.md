@@ -16,6 +16,7 @@ What they cover:
 - UDP flow selection and flow-table lookup/update behavior
 - QUIC upstream establish vs pooled reuse behavior
 - HTTP/3 request bridging from accepted QUIC streams into Pingora request headers
+- bidirectional UDP request/response routing is covered by service-layer runtime tests
 
 ## Build Validation Matrix
 
@@ -26,6 +27,15 @@ The current implementation has been kept build-validated across these feature se
 - `cargo test -p pingora-proxy --lib --no-run --features http3`
 - `cargo test -p pingora --lib --no-run --features http3`
 - `cargo check -p pingora-proxy --example http3_proxy --features http3`
+
+The UDP service layer also contains runtime tests for:
+
+- backend response routing to the original client
+- dropping backend responses after flow expiration
+
+Those tests are logically part of the validation surface, but may still be
+blocked in restricted sandboxes that deny local UDP `connect()` on ephemeral
+flow sockets.
 
 This is intentionally a build and API-surface validation matrix, not a claim of
 full runtime interoperability.
