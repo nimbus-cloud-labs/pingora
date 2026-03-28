@@ -18,9 +18,11 @@ use async_trait::async_trait;
 use log::{debug, error, info};
 #[cfg(feature = "prometheus")]
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 #[cfg(unix)]
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::protocols::l4::datagram::{Datagram, UdpListener};
 use crate::protocols::l4::socket::SocketAddr;
@@ -28,6 +30,8 @@ use crate::protocols::l4::socket::SocketAddr;
 use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
+use crate::upstreams::peer::UdpPeer;
+use crate::upstreams::udp::{UdpFlowTable, UdpPeerSet, UdpSelectionMode};
 
 #[cfg(feature = "prometheus")]
 use prometheus::{register_int_counter_vec, IntCounterVec};
@@ -84,6 +88,11 @@ impl DatagramResponder {
         self.listener.local_addr()
     }
 
+    /// Return the service name associated with this responder.
+    pub fn service_name(&self) -> &str {
+        &self.service_name
+    }
+
     /// Send a datagram to the peer encoded in the packet metadata.
     pub async fn send_datagram(&self, datagram: &Datagram) -> std::io::Result<usize> {
         self.send_to(datagram.payload(), &datagram.meta.peer_addr)
@@ -109,6 +118,100 @@ impl DatagramResponder {
                 );
                 Err(e)
             }
+        }
+    }
+}
+
+/// A UDP forwarding application backed by upstream selection and flow affinity.
+#[derive(Debug)]
+pub struct UdpLoadBalancer {
+    peers: Arc<UdpPeerSet>,
+    selection_mode: UdpSelectionMode,
+    flow_table: Mutex<UdpFlowTable>,
+}
+
+impl UdpLoadBalancer {
+    /// Create a new UDP load balancer with the given peers, selection mode, and idle timeout.
+    pub fn new(
+        peers: Vec<UdpPeer>,
+        selection_mode: UdpSelectionMode,
+        idle_timeout: Duration,
+    ) -> Self {
+        Self {
+            peers: Arc::new(UdpPeerSet::new(peers)),
+            selection_mode,
+            flow_table: Mutex::new(UdpFlowTable::new(idle_timeout)),
+        }
+    }
+
+    fn select_peer_for_datagram(&self, datagram: &Datagram, service_name: &str) -> Option<UdpPeer> {
+        if self.peers.is_empty() {
+            return None;
+        }
+
+        // Responses from upstream peers are recognized but not forwarded back yet.
+        if self.peers.contains_addr(&datagram.meta.peer_addr) {
+            return None;
+        }
+
+        let flow_key = datagram.meta.flow_key(Arc::<str>::from(service_name));
+        let mut flow_table = self.flow_table.lock();
+
+        if let Some(entry) = flow_table.lookup(&flow_key) {
+            if self.peers.is_enabled(entry.peer.address()) {
+                return Some(entry.peer.clone());
+            }
+            let invalid_peer = entry.peer.address().clone();
+            flow_table.invalidate_peer(&invalid_peer);
+        }
+
+        let peer = self.peers.select(self.selection_mode, &flow_key)?.clone();
+        flow_table.upsert(flow_key, peer.clone());
+        Some(peer)
+    }
+
+    /// Enable or disable a backend address for future selection.
+    pub fn set_peer_enabled(&self, addr: &SocketAddr, enabled: bool) -> bool {
+        self.peers.set_enabled(addr, enabled)
+    }
+
+    #[cfg(test)]
+    fn is_peer_enabled(&self, addr: &SocketAddr) -> bool {
+        self.peers.is_enabled(addr)
+    }
+
+    #[cfg(test)]
+    fn tracked_flows(&self) -> usize {
+        self.flow_table.lock().len()
+    }
+}
+
+#[async_trait]
+impl DatagramApp for UdpLoadBalancer {
+    async fn process_new(
+        &self,
+        datagram: Datagram,
+        responder: &DatagramResponder,
+        _shutdown: &ShutdownWatch,
+    ) {
+        let Some(peer) = self.select_peer_for_datagram(&datagram, responder.service_name()) else {
+            debug!(
+                "UDP load balancer {} ignored datagram from {}",
+                responder.service_name(),
+                datagram.meta.peer_addr
+            );
+            return;
+        };
+
+        if let Err(e) = responder.send_to(datagram.payload(), peer.address()).await {
+            error!(
+                "UDP load balancer {} failed forwarding {} bytes from {} to {}: {}",
+                responder.service_name(),
+                datagram.payload().len(),
+                datagram.meta.peer_addr,
+                peer.address(),
+                e
+            );
         }
     }
 }
@@ -315,11 +418,15 @@ impl<A: DatagramApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatagramApp, DatagramResponder, Service};
-    use crate::protocols::l4::datagram::Datagram;
+    use super::{DatagramApp, DatagramResponder, Service, UdpLoadBalancer};
+    use crate::protocols::l4::datagram::{Datagram, DatagramMeta};
+    use crate::protocols::l4::socket::SocketAddr;
     use crate::server::ShutdownWatch;
     use crate::services::Service as ServiceTrait;
+    use crate::upstreams::peer::UdpPeer;
+    use crate::upstreams::udp::UdpSelectionMode;
     use async_trait::async_trait;
+    use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket;
     use tokio::sync::watch;
     use tokio::time::{timeout, Duration};
@@ -348,6 +455,96 @@ mod tests {
             service.endpoints(),
             &["127.0.0.1:9000".to_string(), "127.0.0.1:9001".to_string()]
         );
+    }
+
+    #[test]
+    fn udp_load_balancer_tracks_and_reuses_flow_selection() {
+        let app = UdpLoadBalancer::new(
+            vec![
+                UdpPeer::new("127.0.0.1:5300"),
+                UdpPeer::new("127.0.0.1:5301"),
+            ],
+            UdpSelectionMode::FlowHash,
+            StdDuration::from_secs(30),
+        );
+        let datagram = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50000".parse().unwrap()),
+            },
+            b"hello".to_vec(),
+        );
+
+        let first = app
+            .select_peer_for_datagram(&datagram, "udp-lb")
+            .unwrap()
+            .address()
+            .clone();
+        let second = app
+            .select_peer_for_datagram(&datagram, "udp-lb")
+            .unwrap()
+            .address()
+            .clone();
+
+        assert_eq!(first, second);
+        assert_eq!(app.tracked_flows(), 1);
+    }
+
+    #[test]
+    fn udp_load_balancer_recognizes_backend_responses() {
+        let app = UdpLoadBalancer::new(
+            vec![UdpPeer::new("127.0.0.1:5300")],
+            UdpSelectionMode::FlowHash,
+            StdDuration::from_secs(30),
+        );
+        let backend_datagram = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:5300".parse().unwrap()),
+            },
+            b"response".to_vec(),
+        );
+
+        assert!(app
+            .select_peer_for_datagram(&backend_datagram, "udp-lb")
+            .is_none());
+        assert_eq!(app.tracked_flows(), 0);
+    }
+
+    #[test]
+    fn udp_load_balancer_skips_disabled_peers_and_remaps_flows() {
+        let app = UdpLoadBalancer::new(
+            vec![
+                UdpPeer::new("127.0.0.1:5300"),
+                UdpPeer::new("127.0.0.1:5301"),
+            ],
+            UdpSelectionMode::RoundRobin,
+            StdDuration::from_secs(30),
+        );
+        let datagram = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50000".parse().unwrap()),
+            },
+            b"hello".to_vec(),
+        );
+
+        let first = app
+            .select_peer_for_datagram(&datagram, "udp-lb")
+            .unwrap()
+            .address()
+            .clone();
+        assert!(app.set_peer_enabled(&first, false));
+        assert!(!app.is_peer_enabled(&first));
+
+        let second = app
+            .select_peer_for_datagram(&datagram, "udp-lb")
+            .unwrap()
+            .address()
+            .clone();
+
+        assert_ne!(first, second);
+        assert_eq!(app.tracked_flows(), 1);
     }
 
     #[tokio::test]

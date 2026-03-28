@@ -679,6 +679,86 @@ impl Display for PeerOptions {
     }
 }
 
+/// UDP-specific options for datagram upstream peers.
+#[derive(Clone, Debug, Default)]
+pub struct UdpPeerOptions {
+    /// Preferred local bind address and port policy for outbound UDP traffic.
+    pub bind_to: Option<BindTo>,
+    /// DSCP value to apply to outbound UDP traffic where supported.
+    pub dscp: Option<u8>,
+    /// Optional tracer for UDP transport events.
+    pub tracer: Option<Tracer>,
+}
+
+impl UdpPeerOptions {
+    /// Create a new [`UdpPeerOptions`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
+/// A UDP upstream peer without stream or TLS semantics.
+#[derive(Clone, Debug)]
+pub struct UdpPeer {
+    pub _address: SocketAddr,
+    pub weight: usize,
+    pub options: UdpPeerOptions,
+}
+
+impl UdpPeer {
+    /// Create a new [`UdpPeer`] with weight `1`.
+    pub fn new<A: ToInetSocketAddrs>(address: A) -> Self {
+        Self::new_with_weight(address, 1)
+    }
+
+    /// Create a new [`UdpPeer`] with the given weight.
+    pub fn new_with_weight<A: ToInetSocketAddrs>(address: A, weight: usize) -> Self {
+        let mut addrs_iter = address.to_socket_addrs().unwrap(); // TODO: handle error
+        let addr = addrs_iter.next().unwrap();
+        Self::new_from_sockaddr(SocketAddr::Inet(addr), weight)
+    }
+
+    /// Create a new [`UdpPeer`] from an explicit socket address and weight.
+    pub fn new_from_sockaddr(address: SocketAddr, weight: usize) -> Self {
+        Self {
+            _address: address,
+            weight,
+            options: UdpPeerOptions::new(),
+        }
+    }
+
+    /// Return the destination address for this UDP peer.
+    pub fn address(&self) -> &SocketAddr {
+        &self._address
+    }
+
+    /// Return the configured relative weight for this peer.
+    pub fn weight(&self) -> usize {
+        self.weight
+    }
+
+    /// Return the configured local bind preference if any.
+    pub fn bind_to(&self) -> Option<&BindTo> {
+        self.options.bind_to.as_ref()
+    }
+
+    /// Return the configured DSCP value if any.
+    pub fn dscp(&self) -> Option<u8> {
+        self.options.dscp
+    }
+
+    /// Return the configured tracer if any.
+    pub fn tracer(&self) -> Option<Tracer> {
+        self.options.tracer.clone()
+    }
+}
+
+impl Display for UdpPeer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(f, "addr: {}, weight: {}", self._address, self.weight)
+    }
+}
+
 /// A peer representing the remote HTTP server to connect to
 #[derive(Debug, Clone)]
 pub struct HttpPeer {
@@ -899,6 +979,8 @@ impl Display for Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connectors::l4::BindTo;
+    use crate::protocols::l4::socket::SocketAddr;
 
     #[test]
     fn default_http_upstream_request_policy_is_standards_oriented() {
@@ -916,5 +998,37 @@ mod tests {
         assert!(!policy.strip_connection_nominated);
         assert!(!policy.reject_malformed_connection_nominations);
         assert_eq!(policy.h1_upgrade, H1UpgradePolicy::Preserve);
+    }
+
+    #[test]
+    fn udp_peer_constructs_from_inet_address() {
+        let peer = UdpPeer::new("127.0.0.1:5353");
+
+        assert_eq!(
+            peer.address(),
+            &SocketAddr::Inet("127.0.0.1:5353".parse().unwrap())
+        );
+        assert_eq!(peer.weight(), 1);
+        assert!(peer.bind_to().is_none());
+        assert_eq!(peer.dscp(), None);
+    }
+
+    #[test]
+    fn udp_peer_retains_weight_and_options() {
+        let mut peer = UdpPeer::new_with_weight("127.0.0.1:5300", 7);
+        let mut bind_to = BindTo::default();
+        bind_to.addr = "127.0.0.1:0".parse().ok();
+        peer.options = UdpPeerOptions {
+            bind_to: Some(bind_to),
+            dscp: Some(46),
+            tracer: None,
+        };
+
+        assert_eq!(peer.weight(), 7);
+        assert_eq!(peer.dscp(), Some(46));
+        assert_eq!(
+            peer.bind_to().and_then(|bind| bind.addr),
+            "127.0.0.1:0".parse().ok()
+        );
     }
 }
