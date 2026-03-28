@@ -156,18 +156,59 @@ impl UdpFlowTable {
 
     /// Remove any expired flow entries and return how many were removed.
     pub fn cleanup_expired(&mut self) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| entry.last_seen.elapsed() < self.idle_timeout);
-        before - self.entries.len()
+        self.cleanup_expired_keys().len()
+    }
+
+    /// Remove expired flow entries and return the removed flow keys.
+    pub fn cleanup_expired_keys(&mut self) -> Vec<DatagramFlowKey> {
+        let expired: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(flow_key, entry)| {
+                (entry.last_seen.elapsed() >= self.idle_timeout).then_some(flow_key.clone())
+            })
+            .collect();
+        for flow_key in &expired {
+            self.entries.remove(flow_key);
+        }
+        expired
+    }
+
+    /// Remove the given flow entry and return it if present.
+    pub fn remove(&mut self, flow_key: &DatagramFlowKey) -> Option<UdpFlowEntry> {
+        self.entries.remove(flow_key)
+    }
+
+    /// Remove all flow entries mapped to the given peer address and return the removed keys.
+    pub fn invalidate_peer_keys(&mut self, peer_addr: &SocketAddr) -> Vec<DatagramFlowKey> {
+        let removed: Vec<_> = self
+            .entries
+            .iter()
+            .filter_map(|(flow_key, entry)| {
+                (entry.peer.address() == peer_addr).then_some(flow_key.clone())
+            })
+            .collect();
+        for flow_key in &removed {
+            self.entries.remove(flow_key);
+        }
+        removed
     }
 
     /// Remove all flow entries mapped to the given peer address.
     pub fn invalidate_peer(&mut self, peer_addr: &SocketAddr) -> usize {
-        let before = self.entries.len();
-        self.entries
-            .retain(|_, entry| entry.peer.address() != peer_addr);
-        before - self.entries.len()
+        self.invalidate_peer_keys(peer_addr).len()
+    }
+
+    /// Return the flow key currently mapped to the given backend peer and local address.
+    pub fn find_by_peer(
+        &self,
+        peer_addr: &SocketAddr,
+        local_addr: &SocketAddr,
+    ) -> Option<DatagramFlowKey> {
+        self.entries.iter().find_map(|(flow_key, entry)| {
+            (entry.peer.address() == peer_addr && &flow_key.local_addr == local_addr)
+                .then_some(flow_key.clone())
+        })
     }
 }
 

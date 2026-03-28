@@ -14,10 +14,8 @@
 
 //! This example shows how to route DNS-like UDP request traffic toward upstream servers.
 //!
-//! Note: the current Milestone 2 implementation forwards client datagrams to chosen
-//! backends, but the reverse path from backend to client is not fully wired yet.
-//! This example is therefore useful for validating request-side routing behavior and
-//! flow affinity, not end-to-end DNS proxy correctness.
+//! The UDP load balancer now keeps a per-flow upstream socket so backend responses
+//! can be routed back to the original client generically.
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
