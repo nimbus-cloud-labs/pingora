@@ -91,6 +91,8 @@ mod proxy_common;
 mod proxy_custom;
 mod proxy_h1;
 mod proxy_h2;
+#[cfg(feature = "http3")]
+mod proxy_h3;
 mod proxy_purge;
 mod proxy_trait;
 pub mod subrequest;
@@ -98,11 +100,21 @@ pub mod subrequest;
 use subrequest::{BodyMode, Ctx as SubrequestCtx};
 
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
+#[cfg(feature = "http3")]
+pub use proxy_h3::{
+    DownstreamHttpVersion, Http3AcceptedStream, Http3BridgeStats, Http3CompatibilityReport,
+    Http3DownstreamRequest, Http3DownstreamSession, Http3Negotiation, Http3PhaseCompatibility,
+    Http3ProxyBridge,
+};
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
 
 pub mod prelude {
     pub use crate::{http_proxy, http_proxy_service, ProxyHttp, ProxyWarnLogContext, Session};
+    #[cfg(feature = "http3")]
+    pub use crate::{
+        Http3AcceptedStream, Http3DownstreamRequest, Http3Negotiation, Http3ProxyBridge,
+    };
 }
 
 pub type ProcessCustomSession<SV, C> = Arc<

@@ -47,6 +47,24 @@ Pingora-proxy allows users to insert arbitrary logic into the life of a request.
     IOFailure>IO error]-->error_while_proxy
 ```
 
+### HTTP/3 compatibility note
+The initial downstream HTTP/3 support keeps the existing phase model wherever the logic operates on
+generic `RequestHeader` and `ResponseHeader` state. In practice, these phases are intended to remain
+compatible:
+
+* `early_request_filter()`
+* `request_filter()`
+* `request_body_filter()`
+* `proxy_upstream_filter()`
+* `upstream_peer()`
+* `upstream_request_filter()`
+* `upstream_response_filter()` and downstream response filters
+* `logging()`
+
+The main explicit incompatibility today is downstream HTTP/1.x upgrade semantics. HTTP/3 does not
+use `Connection: upgrade` or `Upgrade: ...`, so logic that depends on downstream upgrade handling
+must be treated as unsupported on the HTTP/3 path until a protocol-native alternative is added.
+
 ### General filter usage guidelines
 * Most filters return a [`pingora_error::Result<_>`](errors.md). When the returned value is `Result::Err`, `fail_to_proxy()` will be called and the request will be terminated.
 * Most filters are async functions, which allows other async operations such as IO to be performed within the filters.

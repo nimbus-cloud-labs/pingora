@@ -116,6 +116,11 @@ rustls = [
 ## This feature will include and export `pingora_proxy::prelude::*`
 proxy = ["pingora-proxy"]
 
+## Enable downstream HTTP/3 proxy foundations
+##
+## This feature enables the HTTP/3 bridge inside `pingora-proxy`
+http3 = ["proxy", "quic", "pingora-proxy?/http3"]
+
 ## Include the [lb](crate::lb) (load-balancing) module
 ##
 ## This feature will include and export `pingora_load_balancing::prelude::*`
@@ -169,6 +174,7 @@ patched_http1 = ["pingora-core/patched_http1", "pingora-proxy?/patched_http1"]
 document-features = [
     "dep:document-features",
     "proxy",
+    "http3",
     "lb",
     "cache",
     "time",
