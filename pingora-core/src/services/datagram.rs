@@ -229,6 +229,18 @@ impl UdpLoadBalancerOptions {
             cleanup_interval: None,
         }
     }
+
+    /// Override the maximum number of tracked flows.
+    pub fn with_max_tracked_flows(mut self, max_tracked_flows: usize) -> Self {
+        self.max_tracked_flows = max_tracked_flows;
+        self
+    }
+
+    /// Override the periodic cleanup cadence for expired flows.
+    pub fn with_cleanup_interval(mut self, cleanup_interval: Option<Duration>) -> Self {
+        self.cleanup_interval = cleanup_interval;
+        self
+    }
 }
 
 impl UdpLoadBalancer {
@@ -447,6 +459,16 @@ impl<A> Service<A> {
     /// Add a UDP listening address to this service.
     pub fn add_udp(&mut self, addr: &str) {
         self.listen_addrs.push(addr.to_string());
+    }
+
+    /// Override the preferred number of worker threads for this service.
+    pub fn set_threads(&mut self, threads: Option<usize>) {
+        self.threads = threads;
+    }
+
+    /// Override the receive buffer size used for incoming datagrams.
+    pub fn set_max_datagram_size(&mut self, max_datagram_size: usize) {
+        self.max_datagram_size = max_datagram_size;
     }
 
     /// Return the configured UDP listening addresses.

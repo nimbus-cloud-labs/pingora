@@ -21,6 +21,7 @@ In this guide, we will cover the most used features, operations and settings of 
 * [Examples: take control of the request](modify_filter.md)
 * [Connection pooling and reuse](pooling.md)
 * [Handling failures and failover](failover.md)
+* [HTTP/3 and QUIC](http3.md)
 * [RateLimiter quickstart](rate_limiter.md)
 
 ## Advanced topics (WIP)

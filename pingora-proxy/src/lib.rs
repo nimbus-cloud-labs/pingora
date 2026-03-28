@@ -104,7 +104,8 @@ pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeTy
 pub use proxy_h3::{
     DownstreamHttpVersion, Http3AcceptedStream, Http3BridgeStats, Http3CompatibilityReport,
     Http3DownstreamRequest, Http3DownstreamSession, Http3Negotiation, Http3PhaseCompatibility,
-    Http3ProxyBridge,
+    Http3ProxyBridge, Http3RetryAction, Http3RetryClassifier, Http3RetryContext,
+    Http3RetryDecision, Http3RetryPolicy, SelectedHttpUpstream,
 };
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};

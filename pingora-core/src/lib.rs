@@ -102,6 +102,7 @@ pub mod services;
 pub mod upstreams;
 pub mod utils;
 
+pub use crate::upstreams::peer::{Http3Peer, HttpUpstreamTransport};
 pub use pingora_error::{ErrorType::*, *};
 
 // If both openssl and boringssl are enabled, prefer boringssl.

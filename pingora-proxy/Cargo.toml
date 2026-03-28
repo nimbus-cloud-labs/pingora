@@ -88,6 +88,11 @@ http3 = ["dep:pingora-quic"]
 name = "connection_filter"
 required-features = ["connection_filter"]
 
+[[bench]]
+name = "http3_bridge"
+harness = false
+required-features = ["http3"]
+
 # or locally cargo doc --config "build.rustdocflags='--cfg doc_async_trait'"
 [package.metadata.docs.rs]
 rustdoc-args = ["--cfg", "doc_async_trait"]

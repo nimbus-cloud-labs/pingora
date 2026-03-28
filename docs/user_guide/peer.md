@@ -87,3 +87,23 @@ and must be used at your own risk; protected nomination validation applies when
 
 ## Examples
 TBD
+
+## HTTP/3 Upstreams
+
+For QUIC-backed upstreams, Pingora also exposes `Http3Peer`.
+
+`Http3Peer` is intentionally separate from `HttpPeer` because it carries
+transport assumptions that do not fit the stream-oriented peer model:
+
+- UDP destination address
+- authority / server name
+- optional local UDP bind address
+- QUIC connect timeout
+- QUIC idle timeout for session reuse
+- ALPN values for `h3`
+
+Use `Http3Peer` together with the HTTP/3 helper APIs in `pingora-proxy` when you
+want upstream transport selection to be explicit rather than inferred from the
+stream-based peer model.
+
+See [HTTP/3 and QUIC](http3.md) for the current feature boundary and limitations.

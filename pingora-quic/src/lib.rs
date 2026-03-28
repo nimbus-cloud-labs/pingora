@@ -27,7 +27,9 @@ use parking_lot::Mutex;
 use pingora_core::protocols::l4::datagram::{Datagram, DatagramFlowKey, UdpListener};
 use pingora_core::protocols::l4::socket::SocketAddr;
 use pingora_error::{Error, ErrorType, Result};
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +63,30 @@ impl QuicListenerConfig {
             max_concurrent_bidi_streams: 128,
             max_datagram_size: 1350,
         }
+    }
+
+    /// Override the ALPN values accepted by this listener.
+    pub fn with_alpn_protocols(mut self, alpn_protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    /// Override the advertised idle timeout.
+    pub fn with_max_idle_timeout(mut self, max_idle_timeout: Duration) -> Self {
+        self.max_idle_timeout = max_idle_timeout;
+        self
+    }
+
+    /// Override the bidirectional stream limit.
+    pub fn with_max_concurrent_bidi_streams(mut self, max_concurrent_bidi_streams: u64) -> Self {
+        self.max_concurrent_bidi_streams = max_concurrent_bidi_streams;
+        self
+    }
+
+    /// Override the datagram receive buffer size.
+    pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
+        self.max_datagram_size = max_datagram_size;
+        self
     }
 
     /// Validate invariants for downstream QUIC listeners.
@@ -98,6 +124,8 @@ pub struct QuicConnectorConfig {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// Handshake timeout budget.
     pub connect_timeout: Duration,
+    /// Maximum idle time before a pooled upstream session expires.
+    pub idle_timeout: Duration,
 }
 
 impl QuicConnectorConfig {
@@ -110,7 +138,38 @@ impl QuicConnectorConfig {
             server_name: None,
             alpn_protocols: Vec::new(),
             connect_timeout: Duration::from_secs(10),
+            idle_timeout: Duration::from_secs(30),
         }
+    }
+
+    /// Override the local UDP bind address.
+    pub fn with_local_bind_addr(mut self, local_bind_addr: Option<SocketAddr>) -> Self {
+        self.local_bind_addr = local_bind_addr;
+        self
+    }
+
+    /// Override the TLS server name used for the QUIC handshake.
+    pub fn with_server_name(mut self, server_name: Option<String>) -> Self {
+        self.server_name = server_name;
+        self
+    }
+
+    /// Override the ALPN values offered by this connector.
+    pub fn with_alpn_protocols(mut self, alpn_protocols: Vec<Vec<u8>>) -> Self {
+        self.alpn_protocols = alpn_protocols;
+        self
+    }
+
+    /// Override the handshake timeout budget.
+    pub fn with_connect_timeout(mut self, connect_timeout: Duration) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Override the idle timeout used by the upstream session pool.
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
     }
 
     /// Validate invariants for upstream QUIC connectors.
@@ -124,6 +183,12 @@ impl QuicConnectorConfig {
             return Error::e_explain(
                 ErrorType::ConnectTimedout,
                 "QUIC connector requires a non-zero connect timeout",
+            );
+        }
+        if self.idle_timeout.is_zero() {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "QUIC connector requires a non-zero idle timeout",
             );
         }
         if self
@@ -156,7 +221,7 @@ pub struct QuicConnectionMeta {
 }
 
 /// A transport-oriented representation of a QUIC upstream destination.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuicUpstreamDestination {
     /// Stable logical name for the service using this destination.
     pub name: Arc<str>,
@@ -168,6 +233,8 @@ pub struct QuicUpstreamDestination {
     pub server_name: Option<String>,
     /// ALPN values offered to the upstream.
     pub alpn_protocols: Vec<Vec<u8>>,
+    /// Maximum idle time before a pooled upstream session expires.
+    pub idle_timeout: Duration,
 }
 
 impl From<&QuicConnectorConfig> for QuicUpstreamDestination {
@@ -178,6 +245,7 @@ impl From<&QuicConnectorConfig> for QuicUpstreamDestination {
             local_bind_addr: config.local_bind_addr.clone(),
             server_name: config.server_name.clone(),
             alpn_protocols: config.alpn_protocols.clone(),
+            idle_timeout: config.idle_timeout,
         }
     }
 }
@@ -544,6 +612,9 @@ impl QuicConnectorHandle {
             },
             established_at,
             connect_timeout: self.config.connect_timeout,
+            idle_timeout: self.config.idle_timeout,
+            last_used_at: established_at,
+            reuse_count: 0,
         })
     }
 }
@@ -559,6 +630,162 @@ pub struct QuicUpstreamSession {
     pub established_at: Instant,
     /// Timeout budget that governed the handshake.
     pub connect_timeout: Duration,
+    /// Maximum idle time before the session should be expired from a reuse pool.
+    pub idle_timeout: Duration,
+    /// Last time this session was checked out or released.
+    pub last_used_at: Instant,
+    /// Number of times this session has been reused after the initial establishment.
+    pub reuse_count: u64,
+}
+
+/// Snapshot of lifecycle counters for the QUIC upstream session pool.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicUpstreamPoolStats {
+    /// Number of fresh sessions established for checkout.
+    pub established_sessions: u64,
+    /// Number of pooled sessions reused for checkout.
+    pub reused_sessions: u64,
+    /// Number of sessions released back to the pool.
+    pub released_sessions: u64,
+    /// Number of idle sessions expired from the pool.
+    pub expired_sessions: u64,
+}
+
+#[derive(Debug, Default)]
+struct QuicUpstreamPoolStatsInner {
+    established_sessions: AtomicU64,
+    reused_sessions: AtomicU64,
+    released_sessions: AtomicU64,
+    expired_sessions: AtomicU64,
+}
+
+impl QuicUpstreamPoolStatsInner {
+    fn snapshot(&self) -> QuicUpstreamPoolStats {
+        QuicUpstreamPoolStats {
+            established_sessions: self.established_sessions.load(Ordering::Relaxed),
+            reused_sessions: self.reused_sessions.load(Ordering::Relaxed),
+            released_sessions: self.released_sessions.load(Ordering::Relaxed),
+            expired_sessions: self.expired_sessions.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// A QUIC-specific pool for upstream sessions, kept separate from TCP connection pools.
+#[derive(Debug, Default)]
+pub struct QuicUpstreamPool {
+    sessions: Mutex<HashMap<u64, Vec<QuicUpstreamSession>>>,
+    stats: QuicUpstreamPoolStatsInner,
+}
+
+impl QuicUpstreamPool {
+    /// Create an empty QUIC upstream session pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return a snapshot of pool lifecycle counters.
+    pub fn stats(&self) -> QuicUpstreamPoolStats {
+        self.stats.snapshot()
+    }
+
+    /// Return the number of pooled sessions currently retained.
+    pub fn pooled_sessions(&self) -> usize {
+        self.sessions.lock().values().map(std::vec::Vec::len).sum()
+    }
+
+    /// Obtain a pooled session if one is still alive, otherwise establish a new one.
+    pub async fn checkout(
+        &self,
+        connector: &QuicConnectorHandle,
+    ) -> Result<(QuicUpstreamSession, bool)> {
+        let destination = connector.destination();
+        let key = upstream_pool_key(&destination);
+        let now = Instant::now();
+        let (mut reused_session, expired) = {
+            let mut sessions = self.sessions.lock();
+            let mut expired = 0u64;
+            let mut reused_session = None;
+
+            if let Some(pool) = sessions.get_mut(&key) {
+                pool.retain(|session| {
+                    let alive = now.duration_since(session.last_used_at) < session.idle_timeout;
+                    if !alive {
+                        expired += 1;
+                    }
+                    alive
+                });
+
+                reused_session = pool.pop();
+                if pool.is_empty() {
+                    sessions.remove(&key);
+                }
+            }
+
+            (reused_session, expired)
+        };
+
+        if expired > 0 {
+            self.stats
+                .expired_sessions
+                .fetch_add(expired, Ordering::Relaxed);
+        }
+
+        if let Some(mut session) = reused_session.take() {
+            session.last_used_at = now;
+            session.reuse_count += 1;
+            session.meta.resumed = true;
+            self.stats.reused_sessions.fetch_add(1, Ordering::Relaxed);
+            debug!(
+                "reused QUIC upstream session {} to {}",
+                destination.name, destination.peer_addr
+            );
+            return Ok((session, true));
+        }
+
+        let session = connector.establish().await?;
+        self.stats
+            .established_sessions
+            .fetch_add(1, Ordering::Relaxed);
+        Ok((session, false))
+    }
+
+    /// Return an upstream session to the QUIC pool for future reuse.
+    pub fn release(&self, mut session: QuicUpstreamSession) {
+        let key = upstream_pool_key(&session.destination);
+        session.last_used_at = Instant::now();
+        let destination = session.destination.clone();
+        self.sessions.lock().entry(key).or_default().push(session);
+        self.stats.released_sessions.fetch_add(1, Ordering::Relaxed);
+        debug!(
+            "released QUIC upstream session {} to {} back to pool",
+            destination.name, destination.peer_addr
+        );
+    }
+
+    /// Remove expired upstream sessions from the pool and return how many were removed.
+    pub fn prune_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock();
+        let mut expired = 0usize;
+
+        sessions.retain(|_, pool| {
+            pool.retain(|session| {
+                let alive = now.duration_since(session.last_used_at) < session.idle_timeout;
+                if !alive {
+                    expired += 1;
+                }
+                alive
+            });
+            !pool.is_empty()
+        });
+
+        if expired > 0 {
+            self.stats
+                .expired_sessions
+                .fetch_add(expired as u64, Ordering::Relaxed);
+        }
+        expired
+    }
 }
 
 /// The transport boundary Pingora expects from a QUIC implementation.
@@ -682,6 +909,12 @@ fn default_local_addr_for(peer_addr: &SocketAddr) -> SocketAddr {
     }
 }
 
+fn upstream_pool_key(destination: &QuicUpstreamDestination) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    destination.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -801,6 +1034,57 @@ mod tests {
         assert_eq!(stats.handshake_attempts, 1);
         assert_eq!(stats.established_sessions, 0);
         assert_eq!(stats.handshake_timeouts, 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_pool_reuses_released_sessions() {
+        let mut config = QuicConnectorConfig::new(
+            "origin-h3",
+            SocketAddr::Inet("127.0.0.1:8443".parse().unwrap()),
+        );
+        config.alpn_protocols.push(b"h3".to_vec());
+        config.server_name = Some("example.com".to_string());
+        config.idle_timeout = Duration::from_secs(30);
+
+        let connector = super::QuicConnectorHandle::new(config).unwrap();
+        let pool = super::QuicUpstreamPool::new();
+
+        let (session, reused) = pool.checkout(&connector).await.unwrap();
+        assert!(!reused);
+        assert_eq!(session.reuse_count, 0);
+        pool.release(session);
+
+        let (session, reused) = pool.checkout(&connector).await.unwrap();
+        assert!(reused);
+        assert_eq!(session.reuse_count, 1);
+        assert!(session.meta.resumed);
+        assert_eq!(pool.pooled_sessions(), 0);
+
+        let stats = pool.stats();
+        assert_eq!(stats.established_sessions, 1);
+        assert_eq!(stats.reused_sessions, 1);
+        assert_eq!(stats.released_sessions, 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_pool_expires_idle_sessions() {
+        let mut config = QuicConnectorConfig::new(
+            "origin-h3",
+            SocketAddr::Inet("127.0.0.1:8443".parse().unwrap()),
+        );
+        config.alpn_protocols.push(b"h3".to_vec());
+        config.idle_timeout = Duration::from_millis(10);
+
+        let connector = super::QuicConnectorHandle::new(config).unwrap();
+        let pool = super::QuicUpstreamPool::new();
+
+        let (session, _) = pool.checkout(&connector).await.unwrap();
+        pool.release(session);
+        std::thread::sleep(Duration::from_millis(20));
+
+        assert_eq!(pool.prune_expired(), 1);
+        assert_eq!(pool.pooled_sessions(), 0);
+        assert_eq!(pool.stats().expired_sessions, 1);
     }
 
     #[test]
