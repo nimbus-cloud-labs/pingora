@@ -1,0 +1,50 @@
+// Copyright 2026 Cloudflare, Inc.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+// http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! This example shows how to route DNS-like UDP request traffic toward upstream servers.
+//!
+//! Note: the current Milestone 2 implementation forwards client datagrams to chosen
+//! backends, but the reverse path from backend to client is not fully wired yet.
+//! This example is therefore useful for validating request-side routing behavior and
+//! flow affinity, not end-to-end DNS proxy correctness.
+
+use pingora_core::server::configuration::Opt;
+use pingora_core::server::Server;
+use pingora_core::services::datagram::{Service, UdpLoadBalancer};
+use pingora_core::upstreams::peer::UdpPeer;
+use pingora_core::upstreams::udp::UdpSelectionMode;
+use pingora_core::Result;
+use std::time::Duration;
+
+fn main() -> Result<()> {
+    let mut server = Server::new(Some(Opt::default()))?;
+    server.bootstrap();
+
+    let upstreams = vec![
+        UdpPeer::new("127.0.0.1:5353"),
+        UdpPeer::new("127.0.0.1:5354"),
+    ];
+
+    let app = UdpLoadBalancer::new(
+        upstreams,
+        UdpSelectionMode::FlowHash,
+        Duration::from_secs(10),
+    );
+
+    let mut udp = Service::new("UDP dns-like router".to_string(), app);
+    udp.add_udp("127.0.0.1:6190");
+
+    server.add_service(udp);
+    server.run_forever();
+}
