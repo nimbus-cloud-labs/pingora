@@ -31,7 +31,7 @@ use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 use crate::upstreams::peer::UdpPeer;
-use crate::upstreams::udp::{UdpFlowTable, UdpPeerSet, UdpSelectionMode};
+use crate::upstreams::udp::{UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode};
 
 #[cfg(feature = "prometheus")]
 use prometheus::{register_int_counter_vec, IntCounterVec};
@@ -151,18 +151,35 @@ impl UdpLoadBalancer {
 
         // Responses from upstream peers are recognized but not forwarded back yet.
         if self.peers.contains_addr(&datagram.meta.peer_addr) {
+            observe_udp_event(service_name, "ignored_upstream");
+            debug!(
+                "UDP load balancer {} ignored upstream datagram from {}",
+                service_name, datagram.meta.peer_addr
+            );
             return None;
         }
 
         let flow_key = datagram.meta.flow_key(Arc::<str>::from(service_name));
         let mut flow_table = self.flow_table.lock();
 
-        if let Some(entry) = flow_table.lookup(&flow_key) {
-            if self.peers.is_enabled(entry.peer.address()) {
-                return Some(entry.peer.clone());
+        match flow_table.lookup(&flow_key) {
+            UdpFlowLookup::Active(entry) => {
+                if self.peers.is_enabled(entry.peer.address()) {
+                    return Some(entry.peer.clone());
+                }
+                let invalid_peer = entry.peer.address().clone();
+                let removed = flow_table.invalidate_peer(&invalid_peer);
+                observe_udp_event(service_name, "flow_remap");
+                debug!(
+                    "UDP load balancer {} remapping flow from disabled peer {} (removed {} entries)",
+                    service_name, invalid_peer, removed
+                );
             }
-            let invalid_peer = entry.peer.address().clone();
-            flow_table.invalidate_peer(&invalid_peer);
+            UdpFlowLookup::Expired => {
+                observe_udp_event(service_name, "flow_expired");
+                debug!("UDP load balancer {} expired idle flow", service_name);
+            }
+            UdpFlowLookup::Missing => {}
         }
 
         let peer = self.peers.select(self.selection_mode, &flow_key)?.clone();
@@ -195,8 +212,9 @@ impl DatagramApp for UdpLoadBalancer {
         _shutdown: &ShutdownWatch,
     ) {
         let Some(peer) = self.select_peer_for_datagram(&datagram, responder.service_name()) else {
+            observe_udp_event(responder.service_name(), "dropped");
             debug!(
-                "UDP load balancer {} ignored datagram from {}",
+                "UDP load balancer {} dropped datagram from {}",
                 responder.service_name(),
                 datagram.meta.peer_addr
             );
