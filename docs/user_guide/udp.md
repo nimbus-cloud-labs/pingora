@@ -59,9 +59,7 @@ forwarding ambiguous payload bytes.
 
 ## Observability
 
-With the `prometheus` feature enabled, Pingora exports:
-
-- `pingora_udp_datagrams_total{service,event}`
+UDP services maintain per-service counters via `Service::stats().snapshot()`.
 
 Current `event` labels include:
 

@@ -236,7 +236,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 4
 
-### Task 4.1
+### [Implemented] Task 4.1
 
 Concise, user-visible summary of the fix
 
@@ -254,8 +254,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Workspace manifest: `/home/alekitto/projects/pingora/Cargo.toml`
 - QUIC strategy note: `/home/alekitto/projects/pingora/docs/codex/quic-integration-strategy.md`
+- Implemented workspace crate and feature gates: `/home/alekitto/projects/pingora/pingora-quic`, `/home/alekitto/projects/pingora/Cargo.toml`, and `/home/alekitto/projects/pingora/pingora/Cargo.toml`
 
-### Task 4.2
+### [Implemented] Task 4.2
 
 Concise, user-visible summary of the fix
 
@@ -273,8 +274,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - New QUIC crate from Task 4.1
 - QUIC strategy note: `/home/alekitto/projects/pingora/docs/codex/quic-integration-strategy.md`
+- Implemented `tokio-quiche` adapter boundary: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
 
-### Task 4.3
+### [Implemented] Task 4.3
 
 Concise, user-visible summary of the fix
 
@@ -292,8 +294,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - UDP service and transport primitives from Milestones 1-3
 - `pingora-quic` crate from Milestone 4
+- Implemented downstream QUIC listener and session tracking: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
 
-### Task 4.4
+### [Implemented] Task 4.4
 
 Concise, user-visible summary of the fix
 
@@ -311,8 +314,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing connector patterns: `/home/alekitto/projects/pingora/pingora-core/src/connectors`
 - New QUIC crate from Milestone 4
+- Implemented upstream QUIC destination and connector session path: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
 
-### Task 4.5
+### [Implemented] Task 4.5
 
 Concise, user-visible summary of the fix
 
@@ -320,16 +324,17 @@ Add first QUIC observability and transport-level error reporting.
 
 Step-by-step, self-contained instructions for implementing the change.
 
-1. Define metrics and logs for handshakes, transport failures, and session lifecycle.
+1. Define lifecycle stats and logs for handshakes, transport failures, and session tracking.
 2. Keep them transport-level, not HTTP-level.
 3. Surface enough metadata to debug handshake and stream establishment problems.
-4. Keep feature-gated builds healthy with and without QUIC enabled.
+4. Keep optional QUIC builds healthy without relying on a Prometheus-specific feature gate.
 5. Add tests where practical for bookkeeping behavior.
 
 Provide just enough context for the assignee to pinpoint the code.
 
 - `pingora-quic` crate from Milestone 4
 - Existing UDP observability patterns in `pingora-core`
+- Implemented QUIC transport lifecycle stats and error reporting: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
 
 ## Milestone 5
 

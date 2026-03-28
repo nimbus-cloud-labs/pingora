@@ -77,6 +77,13 @@ pub mod time {
     pub use pingora_timeout::*;
 }
 
+#[cfg(feature = "quic")]
+#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+/// QUIC transport abstractions and integration points
+pub mod quic {
+    pub use pingora_quic::*;
+}
+
 /// A useful set of types for getting started
 pub mod prelude {
     pub use pingora_core::prelude::*;
@@ -98,4 +105,8 @@ pub mod prelude {
     #[cfg(feature = "time")]
     #[cfg_attr(docsrs, doc(cfg(feature = "time")))]
     pub use pingora_timeout::*;
+
+    #[cfg(feature = "quic")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
+    pub use pingora_quic::*;
 }

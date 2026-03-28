@@ -16,6 +16,7 @@
 
 use parking_lot::RwLock;
 use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::Entry::Occupied;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,7 +48,7 @@ pub struct UdpFlowEntry {
 #[derive(Debug, Clone)]
 pub enum UdpFlowLookup {
     /// A live flow entry was found and refreshed.
-    Active(UdpFlowEntry),
+    Active(Box<UdpFlowEntry>),
     /// The flow entry had expired and was removed.
     Expired,
     /// No flow entry exists for the given key.
@@ -110,14 +111,11 @@ impl UdpFlowTable {
 
     /// Insert or replace a flow entry and mark it as active now.
     pub fn upsert(&mut self, flow_key: DatagramFlowKey, peer: UdpPeer) -> UdpFlowInsert {
-        if self.entries.contains_key(&flow_key) {
-            self.entries.insert(
-                flow_key,
-                UdpFlowEntry {
-                    peer,
-                    last_seen: Instant::now(),
-                },
-            );
+        if let Occupied(mut e) = self.entries.entry(flow_key.clone()) {
+            e.insert(UdpFlowEntry {
+                peer,
+                last_seen: Instant::now(),
+            });
             return UdpFlowInsert::Replaced;
         }
 
@@ -150,7 +148,7 @@ impl UdpFlowTable {
 
         if let Some(entry) = self.entries.get_mut(flow_key) {
             entry.last_seen = Instant::now();
-            return UdpFlowLookup::Active(entry.clone());
+            return UdpFlowLookup::Active(Box::new(entry.clone()));
         }
 
         UdpFlowLookup::Missing
