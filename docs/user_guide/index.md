@@ -11,6 +11,7 @@ In this guide, we will cover the most used features, operations and settings of 
 * [Handling panics](panic.md)
 * [Error logging](error_log.md)
 * [Prometheus](prom.md)
+* [UDP services](udp.md)
 
 ## Building HTTP proxies
 * [Life of a request: `pingora-proxy` phases and filters](phase.md)

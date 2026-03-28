@@ -67,17 +67,32 @@ pub struct Datagram {
     /// Packet metadata describing the local and remote addresses.
     pub meta: DatagramMeta,
     payload: Vec<u8>,
+    truncated: bool,
 }
 
 impl Datagram {
     /// Create a datagram from owned bytes and metadata.
     pub fn new(meta: DatagramMeta, payload: Vec<u8>) -> Self {
-        Self { meta, payload }
+        Self::new_with_truncation(meta, payload, false)
+    }
+
+    /// Create a datagram from owned bytes and explicit truncation status.
+    pub fn new_with_truncation(meta: DatagramMeta, payload: Vec<u8>, truncated: bool) -> Self {
+        Self {
+            meta,
+            payload,
+            truncated,
+        }
     }
 
     /// Borrow the payload as bytes.
     pub fn payload(&self) -> &[u8] {
         &self.payload
+    }
+
+    /// Whether the datagram may have been truncated by the receive buffer.
+    pub fn is_truncated(&self) -> bool {
+        self.truncated
     }
 
     /// Consume the datagram and return the owned payload.
@@ -144,7 +159,11 @@ impl UdpListener {
         let mut buf = vec![0; max_size];
         let (size, meta) = self.recv_from(&mut buf).await?;
         buf.truncate(size);
-        Ok(Datagram::new(meta, buf))
+        // Without recvmsg/MSG_TRUNC we cannot distinguish an exact-fit datagram
+        // from one truncated to the receive buffer, so exact fits are treated as
+        // conservatively truncated at the service layer.
+        let truncated = size == max_size;
+        Ok(Datagram::new_with_truncation(meta, buf, truncated))
     }
 
     /// Send a datagram to the given remote address.
@@ -220,6 +239,17 @@ mod tests {
         assert_eq!(datagram.into_payload(), b"payload".to_vec());
     }
 
+    #[test]
+    fn datagram_tracks_truncation_status() {
+        let meta = DatagramMeta {
+            local_addr: "127.0.0.1:8080".parse().map(SocketAddr::Inet).unwrap(),
+            peer_addr: "127.0.0.1:50000".parse().map(SocketAddr::Inet).unwrap(),
+        };
+
+        assert!(!Datagram::new(meta.clone(), b"payload".to_vec()).is_truncated());
+        assert!(Datagram::new_with_truncation(meta, b"payload".to_vec(), true).is_truncated());
+    }
+
     #[tokio::test]
     async fn udp_listener_receives_and_sends_datagrams() {
         let listener = UdpListener::bind("127.0.0.1:0").await.unwrap();
@@ -251,5 +281,26 @@ mod tests {
         let (size, peer_addr) = client.recv_from(&mut recv).await.unwrap();
         assert_eq!(&recv[..size], b"pong");
         assert_eq!(peer_addr, listener_addr.as_inet().copied().unwrap());
+    }
+
+    #[tokio::test]
+    async fn udp_listener_marks_exact_buffer_fill_as_truncated() {
+        let listener = UdpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener_addr = listener.local_addr().unwrap();
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client
+            .send_to(
+                b"oversized",
+                listener_addr
+                    .as_inet()
+                    .expect("listener should bind to an inet address"),
+            )
+            .await
+            .unwrap();
+
+        let datagram = listener.recv_datagram(4).await.unwrap();
+        assert_eq!(datagram.payload(), b"over");
+        assert!(datagram.is_truncated());
     }
 }

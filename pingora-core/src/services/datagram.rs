@@ -31,7 +31,9 @@ use crate::server::ListenFds;
 use crate::server::ShutdownWatch;
 use crate::services::Service as ServiceTrait;
 use crate::upstreams::peer::UdpPeer;
-use crate::upstreams::udp::{UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode};
+use crate::upstreams::udp::{
+    UdpFlowInsert, UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode,
+};
 
 #[cfg(feature = "prometheus")]
 use prometheus::{register_int_counter_vec, IntCounterVec};
@@ -128,6 +130,33 @@ pub struct UdpLoadBalancer {
     peers: Arc<UdpPeerSet>,
     selection_mode: UdpSelectionMode,
     flow_table: Mutex<UdpFlowTable>,
+    cleanup_interval: Option<Duration>,
+    last_cleanup: Mutex<Option<std::time::Instant>>,
+}
+
+/// Service-level limits and behavior for UDP load balancing.
+///
+/// Forwarding remains best-effort and unbuffered; overload is handled by dropping
+/// new flows once the table reaches capacity.
+#[derive(Debug, Clone)]
+pub struct UdpLoadBalancerOptions {
+    /// Idle timeout for tracked flow affinity.
+    pub idle_timeout: Duration,
+    /// Maximum number of concurrent tracked flows.
+    pub max_tracked_flows: usize,
+    /// Periodic cleanup cadence for expired flows. `None` keeps lazy expiration only.
+    pub cleanup_interval: Option<Duration>,
+}
+
+impl UdpLoadBalancerOptions {
+    /// Create options with the given idle timeout and conservative defaults.
+    pub fn new(idle_timeout: Duration) -> Self {
+        Self {
+            idle_timeout,
+            max_tracked_flows: 65_536,
+            cleanup_interval: None,
+        }
+    }
 }
 
 impl UdpLoadBalancer {
@@ -137,14 +166,62 @@ impl UdpLoadBalancer {
         selection_mode: UdpSelectionMode,
         idle_timeout: Duration,
     ) -> Self {
+        Self::new_with_options(
+            peers,
+            selection_mode,
+            UdpLoadBalancerOptions::new(idle_timeout),
+        )
+    }
+
+    /// Create a new UDP load balancer with explicit service-level options.
+    pub fn new_with_options(
+        peers: Vec<UdpPeer>,
+        selection_mode: UdpSelectionMode,
+        options: UdpLoadBalancerOptions,
+    ) -> Self {
         Self {
             peers: Arc::new(UdpPeerSet::new(peers)),
             selection_mode,
-            flow_table: Mutex::new(UdpFlowTable::new(idle_timeout)),
+            flow_table: Mutex::new(UdpFlowTable::new(
+                options.idle_timeout,
+                options.max_tracked_flows,
+            )),
+            cleanup_interval: options.cleanup_interval,
+            last_cleanup: Mutex::new(None),
+        }
+    }
+
+    fn maybe_cleanup_expired(&self, service_name: &str) {
+        let Some(cleanup_interval) = self.cleanup_interval else {
+            return;
+        };
+
+        let now = std::time::Instant::now();
+        {
+            let last_cleanup = self.last_cleanup.lock();
+            if last_cleanup
+                .as_ref()
+                .is_some_and(|previous| now.duration_since(*previous) < cleanup_interval)
+            {
+                return;
+            }
+        }
+
+        let removed = self.flow_table.lock().cleanup_expired();
+        let mut last_cleanup = self.last_cleanup.lock();
+        *last_cleanup = Some(now);
+        if removed > 0 {
+            observe_udp_event(service_name, "flow_cleanup");
+            debug!(
+                "UDP load balancer {} cleaned up {} expired flows",
+                service_name, removed
+            );
         }
     }
 
     fn select_peer_for_datagram(&self, datagram: &Datagram, service_name: &str) -> Option<UdpPeer> {
+        self.maybe_cleanup_expired(service_name);
+
         if self.peers.is_empty() {
             return None;
         }
@@ -183,7 +260,17 @@ impl UdpLoadBalancer {
         }
 
         let peer = self.peers.select(self.selection_mode, &flow_key)?.clone();
-        flow_table.upsert(flow_key, peer.clone());
+        match flow_table.upsert(flow_key, peer.clone()) {
+            UdpFlowInsert::Inserted | UdpFlowInsert::Replaced => {}
+            UdpFlowInsert::TableFull => {
+                observe_udp_event(service_name, "flow_table_full");
+                debug!(
+                    "UDP load balancer {} dropped new flow because the flow table is full",
+                    service_name
+                );
+                return None;
+            }
+        }
         Some(peer)
     }
 
@@ -200,6 +287,16 @@ impl UdpLoadBalancer {
     #[cfg(test)]
     fn tracked_flows(&self) -> usize {
         self.flow_table.lock().len()
+    }
+
+    #[cfg(test)]
+    fn max_tracked_flows(&self) -> usize {
+        self.flow_table.lock().max_entries()
+    }
+
+    #[cfg(test)]
+    fn flow_idle_timeout(&self) -> Duration {
+        self.flow_table.lock().idle_timeout()
     }
 }
 
@@ -242,6 +339,9 @@ pub struct Service<A> {
     /// The number of preferred threads. `None` to follow global setting.
     pub threads: Option<usize>,
     /// Maximum datagram size to allocate per receive.
+    ///
+    /// Datagram payloads that fill the entire receive buffer are treated as
+    /// truncated and dropped conservatively.
     pub max_datagram_size: usize,
 }
 
@@ -340,6 +440,19 @@ impl<A: DatagramApp + Send + Sync + 'static> Service<A> {
 
             match next {
                 Ok(datagram) => {
+                    if datagram.is_truncated() {
+                        observe_udp_event(&service_name, "truncated");
+                        debug!(
+                            "dropped potentially truncated UDP datagram on service {} via {} from {} ({} bytes, buffer {})",
+                            service_name,
+                            addr,
+                            datagram.meta.peer_addr,
+                            datagram.payload().len(),
+                            max_datagram_size
+                        );
+                        continue;
+                    }
+
                     observe_udp_event(&service_name, "received");
                     let app = app_logic.clone();
                     let responder = responder.clone();
@@ -436,7 +549,7 @@ impl<A: DatagramApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DatagramApp, DatagramResponder, Service, UdpLoadBalancer};
+    use super::{DatagramApp, DatagramResponder, Service, UdpLoadBalancer, UdpLoadBalancerOptions};
     use crate::protocols::l4::datagram::{Datagram, DatagramMeta};
     use crate::protocols::l4::socket::SocketAddr;
     use crate::server::ShutdownWatch;
@@ -565,6 +678,77 @@ mod tests {
         assert_eq!(app.tracked_flows(), 1);
     }
 
+    #[test]
+    fn udp_load_balancer_drops_new_flows_when_table_is_full() {
+        let app = UdpLoadBalancer::new_with_options(
+            vec![
+                UdpPeer::new("127.0.0.1:5300"),
+                UdpPeer::new("127.0.0.1:5301"),
+            ],
+            UdpSelectionMode::FlowHash,
+            UdpLoadBalancerOptions {
+                idle_timeout: StdDuration::from_secs(30),
+                max_tracked_flows: 1,
+                cleanup_interval: None,
+            },
+        );
+        let flow_a = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50000".parse().unwrap()),
+            },
+            b"first".to_vec(),
+        );
+        let flow_b = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50001".parse().unwrap()),
+            },
+            b"second".to_vec(),
+        );
+
+        assert_eq!(app.max_tracked_flows(), 1);
+        assert!(app.select_peer_for_datagram(&flow_a, "udp-lb").is_some());
+        assert!(app.select_peer_for_datagram(&flow_b, "udp-lb").is_none());
+        assert_eq!(app.tracked_flows(), 1);
+    }
+
+    #[test]
+    fn udp_load_balancer_supports_custom_idle_timeout_and_cleanup_cadence() {
+        let app = UdpLoadBalancer::new_with_options(
+            vec![UdpPeer::new("127.0.0.1:5300")],
+            UdpSelectionMode::FlowHash,
+            UdpLoadBalancerOptions {
+                idle_timeout: StdDuration::from_millis(10),
+                max_tracked_flows: 8,
+                cleanup_interval: Some(StdDuration::from_millis(5)),
+            },
+        );
+        let flow_a = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50000".parse().unwrap()),
+            },
+            b"first".to_vec(),
+        );
+        let flow_b = Datagram::new(
+            DatagramMeta {
+                local_addr: SocketAddr::Inet("127.0.0.1:7000".parse().unwrap()),
+                peer_addr: SocketAddr::Inet("127.0.0.1:50001".parse().unwrap()),
+            },
+            b"second".to_vec(),
+        );
+
+        assert_eq!(app.flow_idle_timeout(), StdDuration::from_millis(10));
+        assert!(app.select_peer_for_datagram(&flow_a, "udp-lb").is_some());
+        assert_eq!(app.tracked_flows(), 1);
+
+        std::thread::sleep(StdDuration::from_millis(20));
+
+        assert!(app.select_peer_for_datagram(&flow_b, "udp-lb").is_some());
+        assert_eq!(app.tracked_flows(), 1);
+    }
+
     #[tokio::test]
     async fn datagram_service_echoes_and_shuts_down() {
         let port = std::net::UdpSocket::bind("127.0.0.1:0")
@@ -597,6 +781,44 @@ mod tests {
             .expect("timed out waiting for UDP echo")
             .unwrap();
         assert_eq!(&buf[..size], b"ping");
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), service_handle)
+            .await
+            .expect("timed out waiting for UDP service shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn datagram_service_drops_potentially_truncated_packets() {
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{port}");
+
+        let mut service = Service::new("udp-echo".to_string(), EchoApp);
+        service.add_udp(&listen_addr);
+        service.max_datagram_size = 4;
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let service_handle = tokio::spawn(async move {
+            #[cfg(unix)]
+            ServiceTrait::start_service(&mut service, None, shutdown_rx, 1).await;
+            #[cfg(windows)]
+            ServiceTrait::start_service(&mut service, shutdown_rx, 1).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"oversized", &listen_addr).await.unwrap();
+
+        let mut buf = [0; 32];
+        let received = timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await;
+        assert!(received.is_err(), "oversized datagram should be dropped");
 
         shutdown_tx.send(true).unwrap();
         timeout(Duration::from_secs(1), service_handle)
