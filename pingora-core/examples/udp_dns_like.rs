@@ -21,7 +21,7 @@
 
 use pingora_core::server::configuration::Opt;
 use pingora_core::server::Server;
-use pingora_core::services::datagram::{Service, UdpLoadBalancer};
+use pingora_core::services::datagram::{Service, UdpLoadBalancer, UdpLoadBalancerOptions};
 use pingora_core::upstreams::peer::UdpPeer;
 use pingora_core::upstreams::udp::UdpSelectionMode;
 use pingora_core::Result;
@@ -36,14 +36,19 @@ fn main() -> Result<()> {
         UdpPeer::new("127.0.0.1:5354"),
     ];
 
-    let app = UdpLoadBalancer::new(
+    let app = UdpLoadBalancer::new_with_options(
         upstreams,
         UdpSelectionMode::FlowHash,
-        Duration::from_secs(10),
+        UdpLoadBalancerOptions {
+            idle_timeout: Duration::from_secs(10),
+            max_tracked_flows: 16_384,
+            cleanup_interval: Some(Duration::from_secs(2)),
+        },
     );
 
     let mut udp = Service::new("UDP dns-like router".to_string(), app);
     udp.add_udp("127.0.0.1:6190");
+    udp.max_datagram_size = 1232;
 
     server.add_service(udp);
     server.run_forever();

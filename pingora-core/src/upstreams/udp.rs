@@ -54,25 +54,43 @@ pub enum UdpFlowLookup {
     Missing,
 }
 
+/// The outcome of inserting or refreshing a flow-table entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UdpFlowInsert {
+    /// The flow entry was inserted for the first time.
+    Inserted,
+    /// The flow entry already existed and was replaced.
+    Replaced,
+    /// The table is at capacity and the new flow was rejected.
+    TableFull,
+}
+
 /// A bounded-lifetime UDP flow table keyed by listener-scoped flow IDs.
 #[derive(Debug)]
 pub struct UdpFlowTable {
     entries: HashMap<DatagramFlowKey, UdpFlowEntry>,
     idle_timeout: Duration,
+    max_entries: usize,
 }
 
 impl UdpFlowTable {
-    /// Create a flow table with the given idle timeout.
-    pub fn new(idle_timeout: Duration) -> Self {
+    /// Create a flow table with the given idle timeout and maximum entry count.
+    pub fn new(idle_timeout: Duration, max_entries: usize) -> Self {
         Self {
             entries: HashMap::new(),
             idle_timeout,
+            max_entries,
         }
     }
 
     /// Return the configured idle timeout.
     pub fn idle_timeout(&self) -> Duration {
         self.idle_timeout
+    }
+
+    /// Return the configured maximum number of tracked flow entries.
+    pub fn max_entries(&self) -> usize {
+        self.max_entries
     }
 
     /// Return the current number of tracked flow entries.
@@ -85,8 +103,28 @@ impl UdpFlowTable {
         self.entries.is_empty()
     }
 
+    /// Whether the table is at capacity for new flow entries.
+    pub fn is_full(&self) -> bool {
+        self.entries.len() >= self.max_entries
+    }
+
     /// Insert or replace a flow entry and mark it as active now.
-    pub fn upsert(&mut self, flow_key: DatagramFlowKey, peer: UdpPeer) {
+    pub fn upsert(&mut self, flow_key: DatagramFlowKey, peer: UdpPeer) -> UdpFlowInsert {
+        if self.entries.contains_key(&flow_key) {
+            self.entries.insert(
+                flow_key,
+                UdpFlowEntry {
+                    peer,
+                    last_seen: Instant::now(),
+                },
+            );
+            return UdpFlowInsert::Replaced;
+        }
+
+        if self.is_full() {
+            return UdpFlowInsert::TableFull;
+        }
+
         self.entries.insert(
             flow_key,
             UdpFlowEntry {
@@ -94,6 +132,7 @@ impl UdpFlowTable {
                 last_seen: Instant::now(),
             },
         );
+        UdpFlowInsert::Inserted
     }
 
     /// Look up a flow entry, expiring it first if it is idle.
@@ -244,7 +283,7 @@ impl UdpPeerSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode};
+    use super::{UdpFlowInsert, UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode};
     use crate::protocols::l4::datagram::DatagramFlowKey;
     use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::UdpPeer;
@@ -316,7 +355,7 @@ mod tests {
 
     #[test]
     fn flow_table_lookup_refreshes_active_entries() {
-        let mut table = UdpFlowTable::new(Duration::from_secs(1));
+        let mut table = UdpFlowTable::new(Duration::from_secs(1), 16);
         let key = flow("udp-lb", "127.0.0.1:50000");
         let upstream = peer("127.0.0.1:5300");
 
@@ -337,7 +376,7 @@ mod tests {
 
     #[test]
     fn flow_table_expires_idle_entries() {
-        let mut table = UdpFlowTable::new(Duration::from_millis(10));
+        let mut table = UdpFlowTable::new(Duration::from_millis(10), 16);
         let key = flow("udp-lb", "127.0.0.1:50000");
 
         table.upsert(key.clone(), peer("127.0.0.1:5300"));
@@ -349,7 +388,7 @@ mod tests {
 
     #[test]
     fn flow_table_reports_missing_entries() {
-        let mut table = UdpFlowTable::new(Duration::from_secs(1));
+        let mut table = UdpFlowTable::new(Duration::from_secs(1), 16);
         let key = flow("udp-lb", "127.0.0.1:50000");
 
         assert!(matches!(table.lookup(&key), UdpFlowLookup::Missing));
@@ -357,7 +396,7 @@ mod tests {
 
     #[test]
     fn flow_table_invalidates_entries_for_removed_peer() {
-        let mut table = UdpFlowTable::new(Duration::from_secs(1));
+        let mut table = UdpFlowTable::new(Duration::from_secs(1), 16);
         let flow_a = flow("udp-lb", "127.0.0.1:50000");
         let flow_b = flow("udp-lb", "127.0.0.1:50001");
         let peer_a = peer("127.0.0.1:5300");
@@ -375,5 +414,22 @@ mod tests {
             other => panic!("expected active flow entry, got {other:?}"),
         };
         assert_eq!(flow_b.peer.address(), peer_b.address());
+    }
+
+    #[test]
+    fn flow_table_rejects_new_entries_when_full() {
+        let mut table = UdpFlowTable::new(Duration::from_secs(1), 1);
+        let flow_a = flow("udp-lb", "127.0.0.1:50000");
+        let flow_b = flow("udp-lb", "127.0.0.1:50001");
+        let peer_a = peer("127.0.0.1:5300");
+        let peer_b = peer("127.0.0.1:5301");
+
+        assert_eq!(
+            table.upsert(flow_a.clone(), peer_a.clone()),
+            UdpFlowInsert::Inserted
+        );
+        assert_eq!(table.upsert(flow_a, peer_b), UdpFlowInsert::Replaced);
+        assert_eq!(table.upsert(flow_b, peer_a), UdpFlowInsert::TableFull);
+        assert_eq!(table.len(), 1);
     }
 }

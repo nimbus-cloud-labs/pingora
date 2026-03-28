@@ -154,7 +154,7 @@ Provide just enough context for the assignee to pinpoint the code.
 - Planned flow table from Milestone 2
 - Implemented flow lifecycle observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs` and `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs`
 
-### Task 3.2
+### [Implemented] Task 3.2
 
 Concise, user-visible summary of the fix
 
@@ -172,8 +172,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - UDP flow state implementation from Milestone 2
 - Datagram service layer: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Implemented bounded flow table and overload policy: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs` and `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 
-### Task 3.3
+### [Implemented] Task 3.3
 
 Concise, user-visible summary of the fix
 
@@ -191,8 +192,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Datagram service module: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 - Flow table implementation from Milestone 2
+- Implemented timeout and cleanup options: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 
-### Task 3.4
+### [Implemented] Task 3.4
 
 Concise, user-visible summary of the fix
 
@@ -210,8 +212,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Datagram buffer model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
 - UDP service layer: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Implemented truncation handling and drop behavior: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs` and `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 
-### Task 3.5
+### [Implemented] Task 3.5
 
 Concise, user-visible summary of the fix
 
@@ -229,6 +232,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing docs area: `/home/alekitto/projects/pingora/docs`
 - Existing Prometheus docs: `/home/alekitto/projects/pingora/docs/user_guide/prom.md`
+- Implemented UDP deployment guide: `/home/alekitto/projects/pingora/docs/user_guide/udp.md`
 
 ## Milestone 4
 

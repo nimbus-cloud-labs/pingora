@@ -31,3 +31,11 @@ static MY_COUNTER: Lazy<IntGauge> = Lazy::new(|| {
 ```
 
 This static metric will automatically appear in the Prometheus metric endpoint.
+
+## UDP Metrics
+
+The UDP service path also exports `pingora_udp_datagrams_total{service,event}` when
+the `prometheus` feature is enabled.
+
+See [UDP services](udp.md) for the current event labels and how to interpret
+`flow_table_full`, `truncated`, `flow_remap`, `recv_error`, and `send_error`.
