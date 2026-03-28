@@ -27,6 +27,10 @@ tokio-quiche = { version = "0.16.1", optional = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
+[[bench]]
+name = "upstream_pool"
+harness = false
+
 [features]
 default = []
 tokio-quiche = ["dep:tokio-quiche"]

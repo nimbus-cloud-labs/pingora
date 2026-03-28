@@ -400,7 +400,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 6
 
-### Task 6.1
+### [Implemented] Task 6.1
 
 Concise, user-visible summary of the fix
 
@@ -418,8 +418,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing upstream peer models in `pingora-core`
 - Proxy upstream selection in `pingora-proxy`
+- Implemented `Http3Peer` and transport selection model: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs` and `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
 
-### Task 6.2
+### [Implemented] Task 6.2
 
 Concise, user-visible summary of the fix
 
@@ -437,8 +438,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing pooling code: `/home/alekitto/projects/pingora/pingora-pool`
 - Existing proxy and upstream connection behavior in `pingora-proxy`
+- Implemented QUIC upstream session pool, idle reuse, and expiration behavior: `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`
 
-### Task 6.3
+### [Implemented] Task 6.3
 
 Concise, user-visible summary of the fix
 
@@ -456,10 +458,11 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing failover docs: `/home/alekitto/projects/pingora/docs/user_guide/failover.md`
 - Existing proxy retry behavior in `pingora-proxy`
+- Implemented HTTP/3 retry/failover classifier and policy model: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
 
 ## Milestone 7
 
-### Task 7.1
+### [Implemented] Task 7.1
 
 Concise, user-visible summary of the fix
 
@@ -477,8 +480,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Documentation root: `/home/alekitto/projects/pingora/docs`
 - Existing user guide index: `/home/alekitto/projects/pingora/docs/user_guide/index.md`
+- Implemented HTTP/3 user guide coverage: `/home/alekitto/projects/pingora/docs/user_guide/http3.md`
 
-### Task 7.2
+### [Implemented] Task 7.2
 
 Concise, user-visible summary of the fix
 
@@ -495,8 +499,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Example directories: `/home/alekitto/projects/pingora/pingora-core/examples`, `/home/alekitto/projects/pingora/pingora/examples`, and `/home/alekitto/projects/pingora/pingora-proxy/examples`
+- Implemented HTTP/3 foundation example: `/home/alekitto/projects/pingora/pingora-proxy/examples/http3_proxy.rs`
 
-### Task 7.3
+### [Implemented] Task 7.3
 
 Concise, user-visible summary of the fix
 
@@ -514,8 +519,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing benchmark directories across the workspace
 - New UDP and QUIC crates introduced by earlier milestones
+- Implemented focused benches and validation note: `/home/alekitto/projects/pingora/pingora-core/benches/udp_flow_table.rs`, `/home/alekitto/projects/pingora/pingora-quic/benches/upstream_pool.rs`, `/home/alekitto/projects/pingora/pingora-proxy/benches/http3_bridge.rs`, and `/home/alekitto/projects/pingora/docs/codex/udp-http3-validation.md`
 
-### Task 7.4
+### [Implemented] Task 7.4
 
 Concise, user-visible summary of the fix
 
@@ -533,6 +539,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Server configuration module: `/home/alekitto/projects/pingora/pingora-core/src/server/configuration`
 - Docs and examples added in previous milestones
+- Implemented builder-style config helpers and aligned examples/docs: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`, `/home/alekitto/projects/pingora/pingora-quic/src/lib.rs`, and `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
 
 ## Suggested delivery order
 

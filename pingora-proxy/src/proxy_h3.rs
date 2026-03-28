@@ -16,6 +16,7 @@
 
 use http::header::{self, CONNECTION, HOST, UPGRADE};
 use http::Version;
+use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport, Peer};
 use pingora_error::{Error, ErrorType, Result};
 use pingora_http::{Method, RequestHeader};
 use pingora_quic::{QuicIncomingDatagram, QuicSessionEvent};
@@ -86,6 +87,179 @@ pub enum DownstreamHttpVersion {
     Http2,
     /// HTTP/3
     Http3,
+}
+
+/// Transport choice for an upstream HTTP request as resolved by the proxy layer.
+#[derive(Debug, Clone)]
+pub enum SelectedHttpUpstream {
+    /// HTTP/1.x or HTTP/2 stream-based upstream.
+    Stream(Box<HttpPeer>),
+    /// HTTP/3 QUIC-backed upstream.
+    Http3(Box<Http3Peer>),
+}
+
+impl SelectedHttpUpstream {
+    /// Report the transport category selected for the upstream.
+    pub fn transport(&self) -> HttpUpstreamTransport {
+        match self {
+            SelectedHttpUpstream::Stream(peer) => match peer.get_alpn() {
+                Some(alpn) if alpn.get_min_http_version() >= 2 => HttpUpstreamTransport::Http2,
+                _ => HttpUpstreamTransport::Http1,
+            },
+            SelectedHttpUpstream::Http3(_) => HttpUpstreamTransport::Http3,
+        }
+    }
+}
+
+/// Retry action chosen for an HTTP/3 upstream failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Http3RetryAction {
+    /// Do not retry the request.
+    Fail,
+    /// Retry the request against the same logical upstream peer.
+    RetrySamePeer,
+    /// Retry the request after re-running upstream selection.
+    RetryNextPeer,
+    /// Fall back to a stream-based upstream transport.
+    Fallback(HttpUpstreamTransport),
+}
+
+/// Policy knobs for HTTP/3 upstream retry and failover behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http3RetryPolicy {
+    /// Whether connect-time QUIC failures may fall back to HTTP/2.
+    pub allow_h2_fallback: bool,
+    /// Whether connect-time QUIC failures may fall back to HTTP/1.1.
+    pub allow_h1_fallback: bool,
+}
+
+impl Default for Http3RetryPolicy {
+    fn default() -> Self {
+        Self {
+            allow_h2_fallback: true,
+            allow_h1_fallback: false,
+        }
+    }
+}
+
+/// Request-scoped context used when classifying HTTP/3 upstream failures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Http3RetryContext {
+    /// Whether the request is safe to replay, e.g. idempotent or fully buffered.
+    pub request_can_retry: bool,
+}
+
+/// Normalized decision for HTTP/3 upstream retry, failover, and timeout handling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Http3RetryDecision {
+    /// What the caller should do next.
+    pub action: Http3RetryAction,
+    /// Whether the proxy should mark the underlying error as retryable.
+    pub mark_retryable: bool,
+    /// Whether a fresh QUIC session must be used for the next attempt.
+    pub fresh_session_required: bool,
+    /// Whether upstream peer selection may choose another backend.
+    pub allow_backend_remap: bool,
+}
+
+impl Http3RetryDecision {
+    const fn fail() -> Self {
+        Self {
+            action: Http3RetryAction::Fail,
+            mark_retryable: false,
+            fresh_session_required: false,
+            allow_backend_remap: false,
+        }
+    }
+}
+
+/// Classifies HTTP/3 upstream failures into retry, failover, and fallback actions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Http3RetryClassifier {
+    policy: Http3RetryPolicy,
+}
+
+impl Http3RetryClassifier {
+    /// Create a new classifier with the given policy.
+    pub fn new(policy: Http3RetryPolicy) -> Self {
+        Self { policy }
+    }
+
+    /// Return the currently configured policy.
+    pub fn policy(&self) -> Http3RetryPolicy {
+        self.policy
+    }
+
+    /// Classify a failure that happened before the upstream request was sent.
+    pub fn classify_connect_error(&self, error: &Error) -> Http3RetryDecision {
+        match error.etype() {
+            ErrorType::ConnectTimedout
+            | ErrorType::ConnectRefused
+            | ErrorType::ConnectNoRoute
+            | ErrorType::ConnectError
+            | ErrorType::TLSHandshakeFailure
+            | ErrorType::TLSHandshakeTimedout
+            | ErrorType::HandshakeError => {
+                if self.policy.allow_h2_fallback {
+                    Http3RetryDecision {
+                        action: Http3RetryAction::Fallback(HttpUpstreamTransport::Http2),
+                        mark_retryable: true,
+                        fresh_session_required: true,
+                        allow_backend_remap: true,
+                    }
+                } else if self.policy.allow_h1_fallback {
+                    Http3RetryDecision {
+                        action: Http3RetryAction::Fallback(HttpUpstreamTransport::Http1),
+                        mark_retryable: true,
+                        fresh_session_required: true,
+                        allow_backend_remap: true,
+                    }
+                } else {
+                    Http3RetryDecision {
+                        action: Http3RetryAction::RetryNextPeer,
+                        mark_retryable: true,
+                        fresh_session_required: true,
+                        allow_backend_remap: true,
+                    }
+                }
+            }
+            _ => Http3RetryDecision::fail(),
+        }
+    }
+
+    /// Classify a failure that happened after an upstream HTTP/3 session was selected.
+    pub fn classify_proxy_error(
+        &self,
+        error: &Error,
+        context: Http3RetryContext,
+    ) -> Http3RetryDecision {
+        match error.etype() {
+            ErrorType::ConnectTimedout
+            | ErrorType::ConnectRefused
+            | ErrorType::ConnectNoRoute
+            | ErrorType::ConnectError
+            | ErrorType::TLSHandshakeFailure
+            | ErrorType::TLSHandshakeTimedout
+            | ErrorType::HandshakeError => self.classify_connect_error(error),
+            ErrorType::ConnectionClosed
+            | ErrorType::ReadTimedout
+            | ErrorType::WriteTimedout
+            | ErrorType::ReadError
+            | ErrorType::WriteError => {
+                if context.request_can_retry {
+                    Http3RetryDecision {
+                        action: Http3RetryAction::RetrySamePeer,
+                        mark_retryable: true,
+                        fresh_session_required: true,
+                        allow_backend_remap: false,
+                    }
+                } else {
+                    Http3RetryDecision::fail()
+                }
+            }
+            _ => Http3RetryDecision::fail(),
+        }
+    }
 }
 
 /// Feature-gated downstream HTTP/3 negotiation settings.
@@ -308,10 +482,14 @@ impl Http3ProxyBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::{Http3AcceptedStream, Http3PhaseCompatibility, Http3ProxyBridge};
+    use super::{
+        Http3AcceptedStream, Http3PhaseCompatibility, Http3ProxyBridge, Http3RetryAction,
+        Http3RetryClassifier, Http3RetryContext, Http3RetryPolicy, SelectedHttpUpstream,
+    };
     use http::Version;
     use pingora_core::protocols::l4::datagram::{Datagram, DatagramFlowKey, DatagramMeta};
     use pingora_core::protocols::l4::socket::SocketAddr;
+    use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport};
     use pingora_error::ErrorType;
     use pingora_http::{Method, ResponseHeader};
     use pingora_quic::{
@@ -475,5 +653,76 @@ mod tests {
                 super::DownstreamHttpVersion::Http1
             ]
         );
+    }
+
+    #[test]
+    fn selected_upstream_reports_transport_choice() {
+        let stream = SelectedHttpUpstream::Stream(Box::new(HttpPeer::new(
+            ("127.0.0.1", 8080),
+            false,
+            "example.com".into(),
+        )));
+        assert_eq!(stream.transport(), HttpUpstreamTransport::Http1);
+
+        let http3 = SelectedHttpUpstream::Http3(Box::new(Http3Peer::new(
+            ("127.0.0.1", 8443),
+            "example.com".into(),
+        )));
+        assert_eq!(http3.transport(), HttpUpstreamTransport::Http3);
+    }
+
+    #[test]
+    fn http3_connect_failures_prefer_h2_fallback() {
+        let classifier = Http3RetryClassifier::default();
+        let error = pingora_error::Error::new(ErrorType::ConnectTimedout);
+
+        let decision = classifier.classify_connect_error(&error);
+        assert_eq!(
+            decision.action,
+            Http3RetryAction::Fallback(HttpUpstreamTransport::Http2)
+        );
+        assert!(decision.mark_retryable);
+        assert!(decision.fresh_session_required);
+        assert!(decision.allow_backend_remap);
+    }
+
+    #[test]
+    fn http3_connect_failures_retry_next_peer_without_fallback() {
+        let classifier = Http3RetryClassifier::new(Http3RetryPolicy {
+            allow_h2_fallback: false,
+            allow_h1_fallback: false,
+        });
+        let error = pingora_error::Error::new(ErrorType::ConnectRefused);
+
+        let decision = classifier.classify_connect_error(&error);
+        assert_eq!(decision.action, Http3RetryAction::RetryNextPeer);
+        assert!(decision.mark_retryable);
+        assert!(decision.allow_backend_remap);
+    }
+
+    #[test]
+    fn http3_proxy_timeouts_retry_same_peer_only_when_request_is_safe() {
+        let classifier = Http3RetryClassifier::default();
+        let error = pingora_error::Error::new(ErrorType::ReadTimedout);
+
+        let safe = classifier.classify_proxy_error(
+            &error,
+            Http3RetryContext {
+                request_can_retry: true,
+            },
+        );
+        assert_eq!(safe.action, Http3RetryAction::RetrySamePeer);
+        assert!(safe.mark_retryable);
+        assert!(safe.fresh_session_required);
+        assert!(!safe.allow_backend_remap);
+
+        let unsafe_decision = classifier.classify_proxy_error(
+            &error,
+            Http3RetryContext {
+                request_can_retry: false,
+            },
+        );
+        assert_eq!(unsafe_decision.action, Http3RetryAction::Fail);
+        assert!(!unsafe_decision.mark_retryable);
     }
 }

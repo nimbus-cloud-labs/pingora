@@ -65,3 +65,15 @@ impl ProxyHttp for MyProxy {
     }
 }
 ```
+
+## HTTP/3 upstream semantics
+
+For HTTP/3 upstreams, Pingora keeps retry and failover rules explicit rather than silently treating QUIC like a TCP connection pool.
+
+- Connect-time QUIC failures are safe to retry because no request bytes were sent upstream yet.
+- Connect-time failures may either retry another backend or fall back to HTTP/2 when that policy is enabled.
+- Mid-request transport failures such as `ReadTimedout`, `WriteTimedout`, or `ConnectionClosed` should only be retried when the request is known to be replay-safe.
+- Mid-request HTTP/3 failures default to retrying the same logical peer on a fresh QUIC session, not silently remapping to another backend.
+
+The current HTTP/3 helper types model this explicitly in
+`pingora-proxy::Http3RetryClassifier`, `Http3RetryPolicy`, and `Http3RetryDecision`.

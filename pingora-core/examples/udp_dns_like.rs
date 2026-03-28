@@ -39,16 +39,14 @@ fn main() -> Result<()> {
     let app = UdpLoadBalancer::new_with_options(
         upstreams,
         UdpSelectionMode::FlowHash,
-        UdpLoadBalancerOptions {
-            idle_timeout: Duration::from_secs(10),
-            max_tracked_flows: 16_384,
-            cleanup_interval: Some(Duration::from_secs(2)),
-        },
+        UdpLoadBalancerOptions::new(Duration::from_secs(10))
+            .with_max_tracked_flows(16_384)
+            .with_cleanup_interval(Some(Duration::from_secs(2))),
     );
 
     let mut udp = Service::new("UDP dns-like router".to_string(), app);
     udp.add_udp("127.0.0.1:6190");
-    udp.max_datagram_size = 1232;
+    udp.set_max_datagram_size(1232);
 
     server.add_service(udp);
     server.run_forever();

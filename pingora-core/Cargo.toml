@@ -111,6 +111,10 @@ hyperlocal = "0.9"
 # Match foundations' allocator so workspace all-features tests link one jemalloc.
 jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 
+[[bench]]
+name = "udp_flow_table"
+harness = false
+
 [features]
 default = []
 # Requires building with `--cfg tokio_unstable`.

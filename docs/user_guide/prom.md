@@ -91,3 +91,28 @@ The same pattern applies to QUIC transport stats via `QuicDownstreamListener::st
 
 See [UDP services](udp.md) for the current event labels and how to interpret
 `flow_table_full`, `truncated`, `flow_remap`, `recv_error`, and `send_error`.
+
+## QUIC Metrics
+
+With `quic` enabled, Pingora exposes QUIC transport lifecycle stats through:
+
+- `QuicDownstreamListener::stats()`
+- `QuicConnectorHandle::stats()`
+
+These stats cover the same transport lifecycle signals, including:
+
+- downstream datagrams received or dropped
+- downstream sessions accepted, reused, or expired
+- upstream handshakes attempted, established, timed out, or failed
+
+If you want them in a Prometheus endpoint, bridge those snapshots into application metrics
+the same way as the UDP example above.
+- `session_reused`
+- `session_expired`
+- `session_established`
+- `session_released`
+- `handshake_started`
+- `handshake_established`
+- `handshake_timeout`
+
+See [HTTP/3 and QUIC](http3.md) for the current transport boundary and limitations.

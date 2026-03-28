@@ -11,3 +11,4 @@ This directory contains design and planning notes produced during repository ana
 - [UDP Balancing Model Design Note](udp-balancing-model.md)
 - [UDP Upstream Model Design Note](udp-upstream-model.md)
 - [QUIC Integration Strategy Design Note](quic-integration-strategy.md)
+- [UDP and HTTP/3 Validation Notes](udp-http3-validation.md)

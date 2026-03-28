@@ -773,6 +773,162 @@ pub struct HttpPeer {
     pub options: PeerOptions,
 }
 
+/// Transport choice for an upstream HTTP destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpUpstreamTransport {
+    /// HTTP/1.1 over stream transport.
+    Http1,
+    /// HTTP/2 over stream transport.
+    Http2,
+    /// HTTP/3 over QUIC transport.
+    Http3,
+}
+
+/// Connection and transport options for an HTTP/3 upstream.
+#[derive(Debug, Clone)]
+pub struct Http3PeerOptions {
+    /// Optional local UDP address to bind for upstream QUIC traffic.
+    pub local_bind_addr: Option<SocketAddr>,
+    /// Handshake timeout budget for the upstream QUIC session.
+    pub connect_timeout: Option<Duration>,
+    /// Idle timeout budget for the upstream QUIC session.
+    pub idle_timeout: Option<Duration>,
+    /// DSCP value to apply to the upstream transport when supported.
+    pub dscp: Option<u8>,
+    /// Optional tracer for transport lifecycle events.
+    pub tracer: Option<Tracer>,
+}
+
+impl Http3PeerOptions {
+    /// Create a new [`Http3PeerOptions`].
+    pub fn new() -> Self {
+        Self {
+            local_bind_addr: None,
+            connect_timeout: None,
+            idle_timeout: None,
+            dscp: None,
+            tracer: None,
+        }
+    }
+
+    /// Override the local UDP bind address for the QUIC session.
+    pub fn with_local_bind_addr(mut self, local_bind_addr: Option<SocketAddr>) -> Self {
+        self.local_bind_addr = local_bind_addr;
+        self
+    }
+
+    /// Override the QUIC handshake timeout.
+    pub fn with_connect_timeout(mut self, connect_timeout: Option<Duration>) -> Self {
+        self.connect_timeout = connect_timeout;
+        self
+    }
+
+    /// Override the QUIC idle timeout.
+    pub fn with_idle_timeout(mut self, idle_timeout: Option<Duration>) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Override the DSCP value applied to upstream UDP traffic.
+    pub fn with_dscp(mut self, dscp: Option<u8>) -> Self {
+        self.dscp = dscp;
+        self
+    }
+
+    /// Override the lifecycle tracer.
+    pub fn with_tracer(mut self, tracer: Option<Tracer>) -> Self {
+        self.tracer = tracer;
+        self
+    }
+}
+
+impl Default for Http3PeerOptions {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// A peer representing an upstream HTTP/3 destination over QUIC.
+#[derive(Debug, Clone)]
+pub struct Http3Peer {
+    pub _address: SocketAddr,
+    pub authority: String,
+    pub options: Http3PeerOptions,
+    /// Custom field to isolate session reuse from other upstream groups.
+    pub group_key: u64,
+    /// ALPN protocols to offer, typically containing `h3`.
+    pub alpn: Vec<Vec<u8>>,
+}
+
+impl Http3Peer {
+    fn new_from_sockaddr(address: SocketAddr, authority: String) -> Self {
+        Self {
+            _address: address,
+            authority,
+            options: Http3PeerOptions::new(),
+            group_key: 0,
+            alpn: vec![b"h3".to_vec()],
+        }
+    }
+
+    /// Create a new [`Http3Peer`] with the given socket address and authority.
+    pub fn new<A: ToInetSocketAddrs>(address: A, authority: String) -> Self {
+        let mut addrs_iter = address.to_socket_addrs().unwrap();
+        let addr = addrs_iter.next().unwrap();
+        Self::new_from_sockaddr(SocketAddr::Inet(addr), authority)
+    }
+
+    /// Create a new [`Http3Peer`] from an already-resolved socket address.
+    pub fn new_from_socketaddr(address: SocketAddr, authority: String) -> Self {
+        Self::new_from_sockaddr(address, authority)
+    }
+
+    /// Return the remote UDP address.
+    pub fn address(&self) -> &SocketAddr {
+        &self._address
+    }
+
+    /// Return the authority / server name to present upstream.
+    pub fn authority(&self) -> &str {
+        &self.authority
+    }
+
+    /// Return the configured transport choice.
+    pub fn transport(&self) -> HttpUpstreamTransport {
+        HttpUpstreamTransport::Http3
+    }
+
+    /// Return the configured local bind address if any.
+    pub fn local_bind_addr(&self) -> Option<&SocketAddr> {
+        self.options.local_bind_addr.as_ref()
+    }
+
+    /// Return the configured connect timeout if any.
+    pub fn connect_timeout(&self) -> Option<Duration> {
+        self.options.connect_timeout
+    }
+
+    /// Return the configured idle timeout if any.
+    pub fn idle_timeout(&self) -> Option<Duration> {
+        self.options.idle_timeout
+    }
+
+    /// Return the configured tracer if any.
+    pub fn tracer(&self) -> Option<Tracer> {
+        self.options.tracer.clone()
+    }
+}
+
+impl Display for Http3Peer {
+    fn fmt(&self, f: &mut Formatter<'_>) -> FmtResult {
+        write!(
+            f,
+            "addr: {}, authority: {}, transport: h3",
+            self._address, self.authority
+        )
+    }
+}
+
 impl HttpPeer {
     // These methods are pretty ad-hoc
     pub fn is_tls(&self) -> bool {
@@ -1030,5 +1186,14 @@ mod tests {
             peer.bind_to().and_then(|bind| bind.addr),
             "127.0.0.1:0".parse().ok()
         );
+    }
+
+    #[test]
+    fn http3_peer_defaults_to_h3_transport() {
+        let peer = Http3Peer::new(("127.0.0.1", 8443), "example.com".to_string());
+
+        assert_eq!(peer.transport(), HttpUpstreamTransport::Http3);
+        assert_eq!(peer.authority(), "example.com");
+        assert_eq!(peer.alpn, vec![b"h3".to_vec()]);
     }
 }

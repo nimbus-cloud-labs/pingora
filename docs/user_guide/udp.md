@@ -96,14 +96,12 @@ let app = UdpLoadBalancer::new_with_options(
         UdpPeer::new_with_weight("127.0.0.1:5301", 1),
     ],
     UdpSelectionMode::FlowHash,
-    UdpLoadBalancerOptions {
-        idle_timeout: Duration::from_secs(30),
-        max_tracked_flows: 65_536,
-        cleanup_interval: Some(Duration::from_secs(5)),
-    },
+    UdpLoadBalancerOptions::new(Duration::from_secs(30))
+        .with_max_tracked_flows(65_536)
+        .with_cleanup_interval(Some(Duration::from_secs(5))),
 );
 
 let mut udp = Service::new("UDP load balancer".to_string(), app);
 udp.add_udp("127.0.0.1:6181");
-udp.max_datagram_size = 1400;
+udp.set_max_datagram_size(1400);
 ```

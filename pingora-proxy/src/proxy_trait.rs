@@ -22,6 +22,9 @@ use proxy_cache::range_filter::{self};
 use std::any::Any;
 use std::time::Duration;
 
+#[cfg(feature = "http3")]
+use pingora_core::upstreams::peer::{Http3Peer, HttpUpstreamTransport};
+
 /// Context for proxy warning logs that can be suppressed by
 /// [`ProxyHttp::suppress_proxy_warn_log`].
 ///
@@ -61,6 +64,42 @@ pub trait ProxyHttp {
         session: &mut Session,
         ctx: &mut Self::CTX,
     ) -> Result<Box<HttpPeer>>;
+
+    /// Define which upstream transport should be used for this request.
+    ///
+    /// By default Pingora keeps the existing HTTP/1.x and HTTP/2 behavior by returning
+    /// [`HttpUpstreamTransport::Http1`] or [`HttpUpstreamTransport::Http2`] according to the
+    /// selected [`HttpPeer`] ALPN constraints.
+    #[cfg(feature = "http3")]
+    async fn upstream_transport(
+        &self,
+        session: &mut Session,
+        ctx: &mut Self::CTX,
+    ) -> Result<HttpUpstreamTransport>
+    where
+        Self::CTX: Send + Sync,
+    {
+        let peer = self.upstream_peer(session, ctx).await?;
+        Ok(match peer.get_alpn() {
+            Some(alpn) if alpn.get_min_http_version() >= 2 => HttpUpstreamTransport::Http2,
+            _ => HttpUpstreamTransport::Http1,
+        })
+    }
+
+    /// Define an HTTP/3 upstream destination for this request when QUIC transport is selected.
+    ///
+    /// The default implementation returns `None`, which means no HTTP/3 upstream was configured.
+    #[cfg(feature = "http3")]
+    async fn upstream_http3_peer(
+        &self,
+        _session: &mut Session,
+        _ctx: &mut Self::CTX,
+    ) -> Result<Option<Box<Http3Peer>>>
+    where
+        Self::CTX: Send + Sync,
+    {
+        Ok(None)
+    }
 
     /// Set up downstream modules.
     ///
