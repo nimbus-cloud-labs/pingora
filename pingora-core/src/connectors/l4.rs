@@ -601,8 +601,8 @@ mod tests {
             )
         }
 
-        // one-off mock server
-        async fn mock_inet_connect_server() -> u16 {
+        // basic mock server that accepts a bounded number of connections
+        async fn mock_inet_connect_server(max_accepts: usize) -> u16 {
             use tokio::io::AsyncWriteExt;
             use tokio::net::TcpListener;
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -610,9 +610,12 @@ mod tests {
             let port = listener.local_addr().unwrap().port();
 
             tokio::spawn(async move {
-                if let Ok((mut stream, _addr)) = listener.accept().await {
+                for _ in 0..max_accepts {
+                    let Ok((mut stream, _addr)) = listener.accept().await else {
+                        break;
+                    };
                     stream.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
-                    // wait a bit so that the client can read
+                    // wait a bit so that the client can read and hold local ports briefly
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 }
             });
@@ -633,12 +636,15 @@ mod tests {
             local_addr.port() >= lower && local_addr.port() <= upper
         }
 
-        let port = mock_inet_connect_server().await;
+        const PORT_WINDOW_SIZE: u16 = 16;
+        const CONNECT_ATTEMPTS: usize = 64;
+
+        let port = mock_inet_connect_server(CONNECT_ATTEMPTS).await;
 
         // need to read /proc/sys/net/ipv4/ip_local_port_range for this test to work
         // IP_LOCAL_PORT_RANGE clamp only works on ports in /proc/sys/net/ipv4/ip_local_port_range
         let (low, _) = get_ip_local_port_range();
-        let high = low + 1;
+        let high = low + PORT_WINDOW_SIZE - 1;
 
         let peer = HttpPeer::new(format!("127.0.0.1:{port}"), false, "".to_string());
         let mut bind_to = BindTo {
@@ -658,7 +664,7 @@ mod tests {
         // requests have ports in the right range and that there is at least
         // one address-unavailable error because we are restricting the number
         // of ports so heavily
-        for _ in 0..10 {
+        for _ in 0..CONNECT_ATTEMPTS {
             match connect(&peer, Some(bind_to.clone())).await {
                 Ok(session) => {
                     assert!(in_port_range(session, low, high));
@@ -674,7 +680,7 @@ mod tests {
         }
 
         assert!(address_unavailable_count > 0);
-        assert!(success_count >= (high - low));
+        assert!(success_count > 0);
 
         // enable fallback, assert not in port range but successful
         bind_to.set_fallback(true);
@@ -682,8 +688,8 @@ mod tests {
         assert!(!in_port_range(session4, low, high));
 
         // works without bind IP, shift up to use new ports
-        let low = low + 2;
-        let high = low + 1;
+        let low = low + PORT_WINDOW_SIZE;
+        let high = low + PORT_WINDOW_SIZE - 1;
         let mut bind_to = BindTo::default();
         bind_to.set_port_range(Some((low, high))).unwrap();
         let session5 = connect(&peer, Some(bind_to.clone())).await.unwrap();

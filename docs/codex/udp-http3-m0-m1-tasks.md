@@ -90,7 +90,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 1
 
-### Task 1.1
+### [Implemented] Task 1.1
 
 Concise, user-visible summary of the fix
 
@@ -108,8 +108,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Current stream listener enum: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/listener.rs`
 - Current listener endpoint machinery: `/home/alekitto/projects/pingora/pingora-core/src/listeners/l4.rs`
+- Implemented UDP listener module: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
 
-### Task 1.2
+### [Implemented] Task 1.2
 
 Concise, user-visible summary of the fix
 
@@ -127,8 +128,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing socket and digest utilities: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/socket.rs`
 - Existing protocol digest types: `/home/alekitto/projects/pingora/pingora-core/src/protocols/digest.rs`
+- Implemented datagram model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
 
-### Task 1.3
+### [Implemented] Task 1.3
 
 Concise, user-visible summary of the fix
 
@@ -147,8 +149,10 @@ Provide just enough context for the assignee to pinpoint the code.
 - Core service traits and lifecycle: `/home/alekitto/projects/pingora/pingora-core/src/services/mod.rs`
 - Existing listening service support: `/home/alekitto/projects/pingora/pingora-core/src/services/listening.rs`
 - Server assembly: `/home/alekitto/projects/pingora/pingora-core/src/server/mod.rs`
+- Implemented datagram service module: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Example UDP service: `/home/alekitto/projects/pingora/pingora-core/examples/udp_echo.rs`
 
-### Task 1.4
+### [Implemented] Task 1.4
 
 Concise, user-visible summary of the fix
 
@@ -166,8 +170,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing Prometheus-related service docs and code patterns: `/home/alekitto/projects/pingora/docs/user_guide/prom.md`
 - Listener and service code paths to instrument: `/home/alekitto/projects/pingora/pingora-core/src/listeners` and `/home/alekitto/projects/pingora/pingora-core/src/services`
+- Implemented UDP service observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 
-### Task 1.5
+### [Implemented] Task 1.5
 
 Concise, user-visible summary of the fix
 
@@ -185,6 +190,8 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing examples layout for reference: `/home/alekitto/projects/pingora/pingora/examples` and `/home/alekitto/projects/pingora/pingora-proxy/examples`
 - Existing tests around listener and service behavior: `/home/alekitto/projects/pingora/pingora-core/src/listeners` and `/home/alekitto/projects/pingora/pingora-core/src/services`
+- Example UDP service: `/home/alekitto/projects/pingora/pingora-core/examples/udp_echo.rs`
+- End-to-end datagram service test: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 
 ## Suggested delivery order
 

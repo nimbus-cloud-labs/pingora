@@ -38,6 +38,7 @@ use crate::server::RuntimeOpts;
 use crate::server::ShutdownWatch;
 
 pub mod background;
+pub mod datagram;
 pub mod listening;
 
 /// A notification channel for signaling when a service has become ready.
