@@ -43,6 +43,17 @@ pub struct UdpFlowEntry {
     pub last_seen: Instant,
 }
 
+/// The outcome of a flow-table lookup.
+#[derive(Debug, Clone)]
+pub enum UdpFlowLookup {
+    /// A live flow entry was found and refreshed.
+    Active(UdpFlowEntry),
+    /// The flow entry had expired and was removed.
+    Expired,
+    /// No flow entry exists for the given key.
+    Missing,
+}
+
 /// A bounded-lifetime UDP flow table keyed by listener-scoped flow IDs.
 #[derive(Debug)]
 pub struct UdpFlowTable {
@@ -86,7 +97,7 @@ impl UdpFlowTable {
     }
 
     /// Look up a flow entry, expiring it first if it is idle.
-    pub fn lookup(&mut self, flow_key: &DatagramFlowKey) -> Option<&UdpFlowEntry> {
+    pub fn lookup(&mut self, flow_key: &DatagramFlowKey) -> UdpFlowLookup {
         let expired = self
             .entries
             .get(flow_key)
@@ -95,14 +106,15 @@ impl UdpFlowTable {
 
         if expired {
             self.entries.remove(flow_key);
-            return None;
+            return UdpFlowLookup::Expired;
         }
 
         if let Some(entry) = self.entries.get_mut(flow_key) {
             entry.last_seen = Instant::now();
+            return UdpFlowLookup::Active(entry.clone());
         }
 
-        self.entries.get(flow_key)
+        UdpFlowLookup::Missing
     }
 
     /// Remove any expired flow entries and return how many were removed.
@@ -232,7 +244,7 @@ impl UdpPeerSet {
 
 #[cfg(test)]
 mod tests {
-    use super::{UdpFlowTable, UdpPeerSet, UdpSelectionMode};
+    use super::{UdpFlowLookup, UdpFlowTable, UdpPeerSet, UdpSelectionMode};
     use crate::protocols::l4::datagram::DatagramFlowKey;
     use crate::protocols::l4::socket::SocketAddr;
     use crate::upstreams::peer::UdpPeer;
@@ -309,9 +321,15 @@ mod tests {
         let upstream = peer("127.0.0.1:5300");
 
         table.upsert(key.clone(), upstream.clone());
-        let first_seen = table.lookup(&key).unwrap().last_seen;
+        let first_seen = match table.lookup(&key) {
+            UdpFlowLookup::Active(entry) => entry.last_seen,
+            other => panic!("expected active flow entry, got {other:?}"),
+        };
         std::thread::sleep(Duration::from_millis(5));
-        let refreshed = table.lookup(&key).unwrap();
+        let refreshed = match table.lookup(&key) {
+            UdpFlowLookup::Active(entry) => entry,
+            other => panic!("expected active flow entry, got {other:?}"),
+        };
 
         assert_eq!(refreshed.peer.address(), upstream.address());
         assert!(refreshed.last_seen >= first_seen);
@@ -325,8 +343,16 @@ mod tests {
         table.upsert(key.clone(), peer("127.0.0.1:5300"));
         std::thread::sleep(Duration::from_millis(20));
 
-        assert!(table.lookup(&key).is_none());
+        assert!(matches!(table.lookup(&key), UdpFlowLookup::Expired));
         assert!(table.is_empty());
+    }
+
+    #[test]
+    fn flow_table_reports_missing_entries() {
+        let mut table = UdpFlowTable::new(Duration::from_secs(1));
+        let key = flow("udp-lb", "127.0.0.1:50000");
+
+        assert!(matches!(table.lookup(&key), UdpFlowLookup::Missing));
     }
 
     #[test]
@@ -343,10 +369,11 @@ mod tests {
         let removed = table.invalidate_peer(peer_a.address());
 
         assert_eq!(removed, 1);
-        assert!(table.lookup(&flow_a).is_none());
-        assert_eq!(
-            table.lookup(&flow_b).unwrap().peer.address(),
-            peer_b.address()
-        );
+        assert!(matches!(table.lookup(&flow_a), UdpFlowLookup::Missing));
+        let flow_b = match table.lookup(&flow_b) {
+            UdpFlowLookup::Active(entry) => entry,
+            other => panic!("expected active flow entry, got {other:?}"),
+        };
+        assert_eq!(flow_b.peer.address(), peer_b.address());
     }
 }

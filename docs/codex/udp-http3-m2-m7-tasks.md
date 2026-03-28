@@ -134,7 +134,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 3
 
-### Task 3.1
+### [Implemented] Task 3.1
 
 Concise, user-visible summary of the fix
 
@@ -152,6 +152,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - UDP service observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
 - Planned flow table from Milestone 2
+- Implemented flow lifecycle observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs` and `/home/alekitto/projects/pingora/pingora-core/src/upstreams/udp.rs`
 
 ### Task 3.2
 
