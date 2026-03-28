@@ -25,6 +25,7 @@ rustdoc-args = ["--cfg", "docsrs"]
 pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
 pingora-timeout = { version = "0.9.0", path = "../pingora-timeout" }
+pingora-quic = { version = "0.9.0", path = "../pingora-quic", optional = true }
 pingora-load-balancing = { version = "0.9.0", path = "../pingora-load-balancing", optional = true, default-features = false }
 pingora-proxy = { version = "0.9.0", path = "../pingora-proxy", optional = true, default-features = false }
 pingora-cache = { version = "0.9.0", path = "../pingora-cache", optional = true, default-features = false }
@@ -128,6 +129,11 @@ cache = ["pingora-cache"]
 ## Enable time/scheduling functionality
 time = []
 
+## Include the [quic](crate::quic) module
+##
+## This feature will include and export `pingora_quic::*`
+quic = ["dep:pingora-quic"]
+
 ## Enable sentry for error notifications
 sentry = ["pingora-core/sentry"]
 
@@ -166,6 +172,7 @@ document-features = [
     "lb",
     "cache",
     "time",
+    "quic",
     "sentry",
     "dial9",
     "dial9-worker-s3",

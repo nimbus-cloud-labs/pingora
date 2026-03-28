@@ -1,0 +1,32 @@
+[package]
+name = "pingora-quic"
+version = "0.8.0"
+authors = ["Yuchen Wu <yuchen@cloudflare.com>"]
+license = "Apache-2.0"
+edition = "2021"
+repository = "https://github.com/cloudflare/pingora"
+categories = ["asynchronous", "network-programming"]
+keywords = ["quic", "udp", "network", "pingora"]
+description = """
+QUIC transport abstractions and integration points for Pingora.
+"""
+
+[lib]
+name = "pingora_quic"
+path = "src/lib.rs"
+
+[dependencies]
+async-trait = { workspace = true }
+log = { workspace = true }
+parking_lot = "0.12"
+pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
+pingora-error = { version = "0.8.0", path = "../pingora-error" }
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-quiche = { version = "0.16.1", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = []
+tokio-quiche = ["dep:tokio-quiche"]
