@@ -338,7 +338,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 5
 
-### Task 5.1
+### [Implemented] Task 5.1
 
 Concise, user-visible summary of the fix
 
@@ -356,8 +356,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Proxy crate: `/home/alekitto/projects/pingora/pingora-proxy`
 - QUIC crate from Milestone 4
+- Implemented HTTP/3 downstream bridge: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
 
-### Task 5.2
+### [Implemented] Task 5.2
 
 Concise, user-visible summary of the fix
 
@@ -375,8 +376,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Proxy phase system: `/home/alekitto/projects/pingora/pingora-proxy`
 - Existing guide on phases and filters: `/home/alekitto/projects/pingora/docs/user_guide/phase.md`
+- Implemented HTTP/3 compatibility bridge and explicit unsupported cases: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
 
-### Task 5.3
+### [Implemented] Task 5.3
 
 Concise, user-visible summary of the fix
 
@@ -394,6 +396,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Existing examples that strip `alt-svc`: `/home/alekitto/projects/pingora/pingora-proxy/examples/gateway.rs`
 - Existing docs mentioning lack of h3: `/home/alekitto/projects/pingora/docs/user_guide/modify_filter.md`
+- Implemented HTTP/3 negotiation policy and `alt-svc` advertisement helpers: `/home/alekitto/projects/pingora/pingora-proxy/src/proxy_h3.rs`
 
 ## Milestone 6
 

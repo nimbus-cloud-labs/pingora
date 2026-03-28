@@ -37,7 +37,7 @@ impl ProxyHttp for MyGateway {
 
 ## Modifying headers
 
-Both request and response headers can be added, removed or modified in their corresponding phases. In the following example, we add logic to the `response_filter` phase to update the `Server` header and remove the `alt-svc` header.
+Both request and response headers can be added, removed or modified in their corresponding phases. In the following example, we add logic to the `response_filter` phase to update the `Server` header and apply the current HTTP/3 advertisement policy.
 
 ```Rust
 #[async_trait]
@@ -56,13 +56,14 @@ impl ProxyHttp for MyGateway {
         upstream_response
             .insert_header("Server", "MyGateway")
             .unwrap();
-        // because we don't support h3
-        upstream_response.remove_header("alt-svc");
+        self.http3.apply_alt_svc(upstream_response)?;
 
         Ok(())
     }
 }
 ```
+
+When downstream HTTP/3 is disabled, `Http3Negotiation::default()` removes `alt-svc` to keep fallback behavior predictable. When enabled, it advertises `h3` while preserving HTTP/2 and HTTP/1.1 as fallback protocols.
 
 ## Return Error pages
 
