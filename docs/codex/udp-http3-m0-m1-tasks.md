@@ -23,10 +23,10 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing stream listener abstraction: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/listener.rs`
-- Existing stream wrapper: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/stream.rs`
-- Current listener stack assembly: `/home/alekitto/projects/pingora/pingora-core/src/listeners/mod.rs`
-- Design note produced: `/home/alekitto/projects/pingora/docs/codex/udp-transport-boundary.md`
+- Existing stream listener abstraction: `pingora-core/src/protocols/l4/listener.rs`
+- Existing stream wrapper: `pingora-core/src/protocols/l4/stream.rs`
+- Current listener stack assembly: `pingora-core/src/listeners/mod.rs`
+- Design note produced: `docs/codex/udp-transport-boundary.md`
 
 ### [Implemented] Task 0.2
 
@@ -44,9 +44,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing load balancing crate for reference patterns: `/home/alekitto/projects/pingora/pingora-load-balancing`
-- Existing upstream peer model: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
-- Design note produced: `/home/alekitto/projects/pingora/docs/codex/udp-balancing-model.md`
+- Existing load balancing crate for reference patterns: `pingora-load-balancing`
+- Existing upstream peer model: `pingora-core/src/upstreams/peer.rs`
+- Design note produced: `docs/codex/udp-balancing-model.md`
 
 ### [Implemented] Task 0.3
 
@@ -64,9 +64,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Upstream peer API: `/home/alekitto/projects/pingora/pingora-core/src/upstreams/peer.rs`
-- Existing L4 connector logic: `/home/alekitto/projects/pingora/pingora-core/src/connectors/l4.rs`
-- Design note produced: `/home/alekitto/projects/pingora/docs/codex/udp-upstream-model.md`
+- Upstream peer API: `pingora-core/src/upstreams/peer.rs`
+- Existing L4 connector logic: `pingora-core/src/connectors/l4.rs`
+- Design note produced: `docs/codex/udp-upstream-model.md`
 
 ### [Implemented] Task 0.4
 
@@ -84,9 +84,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing TLS and protocol boundaries: `/home/alekitto/projects/pingora/pingora-core/src/protocols`
-- Existing connector and listener stack: `/home/alekitto/projects/pingora/pingora-core/src/connectors` and `/home/alekitto/projects/pingora/pingora-core/src/listeners`
-- Design note produced: `/home/alekitto/projects/pingora/docs/codex/quic-integration-strategy.md`
+- Existing TLS and protocol boundaries: `pingora-core/src/protocols`
+- Existing connector and listener stack: `pingora-core/src/connectors` and `pingora-core/src/listeners`
+- Design note produced: `docs/codex/quic-integration-strategy.md`
 
 ## Milestone 1
 
@@ -106,9 +106,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Current stream listener enum: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/listener.rs`
-- Current listener endpoint machinery: `/home/alekitto/projects/pingora/pingora-core/src/listeners/l4.rs`
-- Implemented UDP listener module: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
+- Current stream listener enum: `pingora-core/src/protocols/l4/listener.rs`
+- Current listener endpoint machinery: `pingora-core/src/listeners/l4.rs`
+- Implemented UDP listener module: `pingora-core/src/protocols/l4/datagram.rs`
 
 ### [Implemented] Task 1.2
 
@@ -126,9 +126,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing socket and digest utilities: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/socket.rs`
-- Existing protocol digest types: `/home/alekitto/projects/pingora/pingora-core/src/protocols/digest.rs`
-- Implemented datagram model: `/home/alekitto/projects/pingora/pingora-core/src/protocols/l4/datagram.rs`
+- Existing socket and digest utilities: `pingora-core/src/protocols/l4/socket.rs`
+- Existing protocol digest types: `pingora-core/src/protocols/digest.rs`
+- Implemented datagram model: `pingora-core/src/protocols/l4/datagram.rs`
 
 ### [Implemented] Task 1.3
 
@@ -146,11 +146,11 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Core service traits and lifecycle: `/home/alekitto/projects/pingora/pingora-core/src/services/mod.rs`
-- Existing listening service support: `/home/alekitto/projects/pingora/pingora-core/src/services/listening.rs`
-- Server assembly: `/home/alekitto/projects/pingora/pingora-core/src/server/mod.rs`
-- Implemented datagram service module: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
-- Example UDP service: `/home/alekitto/projects/pingora/pingora-core/examples/udp_echo.rs`
+- Core service traits and lifecycle: `pingora-core/src/services/mod.rs`
+- Existing listening service support: `pingora-core/src/services/listening.rs`
+- Server assembly: `pingora-core/src/server/mod.rs`
+- Implemented datagram service module: `pingora-core/src/services/datagram.rs`
+- Example UDP service: `pingora-core/examples/udp_echo.rs`
 
 ### [Implemented] Task 1.4
 
@@ -168,9 +168,9 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing Prometheus-related service docs and code patterns: `/home/alekitto/projects/pingora/docs/user_guide/prom.md`
-- Listener and service code paths to instrument: `/home/alekitto/projects/pingora/pingora-core/src/listeners` and `/home/alekitto/projects/pingora/pingora-core/src/services`
-- Implemented UDP service observability: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Existing Prometheus-related service docs and code patterns: `docs/user_guide/prom.md`
+- Listener and service code paths to instrument: `pingora-core/src/listeners` and `pingora-core/src/services`
+- Implemented UDP service observability: `pingora-core/src/services/datagram.rs`
 
 ### [Implemented] Task 1.5
 
@@ -188,10 +188,10 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing examples layout for reference: `/home/alekitto/projects/pingora/pingora/examples` and `/home/alekitto/projects/pingora/pingora-proxy/examples`
-- Existing tests around listener and service behavior: `/home/alekitto/projects/pingora/pingora-core/src/listeners` and `/home/alekitto/projects/pingora/pingora-core/src/services`
-- Example UDP service: `/home/alekitto/projects/pingora/pingora-core/examples/udp_echo.rs`
-- End-to-end datagram service test: `/home/alekitto/projects/pingora/pingora-core/src/services/datagram.rs`
+- Existing examples layout for reference: `pingora/examples` and `pingora-proxy/examples`
+- Existing tests around listener and service behavior: `pingora-core/src/listeners` and `pingora-core/src/services`
+- Example UDP service: `pingora-core/examples/udp_echo.rs`
+- End-to-end datagram service test: `pingora-core/src/services/datagram.rs`
 
 ## Suggested delivery order
 
