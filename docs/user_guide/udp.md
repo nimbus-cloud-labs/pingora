@@ -4,10 +4,10 @@ Pingora's UDP path is designed for datagram-aware forwarding and load balancing.
 It is intentionally conservative today:
 
 - flow affinity is tracked with a bounded flow table
-- forwarding is best-effort and unbuffered
+- forwarding is best-effort, unbuffered, and bidirectional
 - datagrams that fill the receive buffer are treated as truncated and dropped
 - IP fragmentation is not reconstructed in user space
-- the current UDP load balancer forwards client-to-upstream traffic first; backend-to-client response routing is still incomplete
+- generic response routing uses one upstream UDP socket per tracked flow
 
 ## Operational Defaults
 

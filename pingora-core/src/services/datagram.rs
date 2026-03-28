@@ -22,6 +22,8 @@ use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UdpSocket;
+use tokio::sync::watch;
 
 use crate::protocols::l4::datagram::{Datagram, UdpListener};
 use crate::protocols::l4::socket::SocketAddr;
@@ -45,6 +47,12 @@ enum DatagramMetricEvent {
     FlowExpired,
     FlowCleanup,
     FlowTableFull,
+    FlowSocketOpened,
+    FlowSocketClosed,
+    ResponseReceived,
+    ResponseFlowMissing,
+    ResponseDropped,
+    ResponseSent,
     Truncated,
     Dropped,
 }
@@ -61,6 +69,12 @@ pub struct DatagramServiceStatsSnapshot {
     pub flow_expired: u64,
     pub flow_cleanup: u64,
     pub flow_table_full: u64,
+    pub flow_socket_opened: u64,
+    pub flow_socket_closed: u64,
+    pub response_received: u64,
+    pub response_flow_missing: u64,
+    pub response_dropped: u64,
+    pub response_sent: u64,
     pub truncated: u64,
     pub dropped: u64,
 }
@@ -77,6 +91,12 @@ pub struct DatagramServiceStats {
     flow_expired: AtomicU64,
     flow_cleanup: AtomicU64,
     flow_table_full: AtomicU64,
+    flow_socket_opened: AtomicU64,
+    flow_socket_closed: AtomicU64,
+    response_received: AtomicU64,
+    response_flow_missing: AtomicU64,
+    response_dropped: AtomicU64,
+    response_sent: AtomicU64,
     truncated: AtomicU64,
     dropped: AtomicU64,
 }
@@ -93,6 +113,12 @@ impl DatagramServiceStats {
             DatagramMetricEvent::FlowExpired => &self.flow_expired,
             DatagramMetricEvent::FlowCleanup => &self.flow_cleanup,
             DatagramMetricEvent::FlowTableFull => &self.flow_table_full,
+            DatagramMetricEvent::FlowSocketOpened => &self.flow_socket_opened,
+            DatagramMetricEvent::FlowSocketClosed => &self.flow_socket_closed,
+            DatagramMetricEvent::ResponseReceived => &self.response_received,
+            DatagramMetricEvent::ResponseFlowMissing => &self.response_flow_missing,
+            DatagramMetricEvent::ResponseDropped => &self.response_dropped,
+            DatagramMetricEvent::ResponseSent => &self.response_sent,
             DatagramMetricEvent::Truncated => &self.truncated,
             DatagramMetricEvent::Dropped => &self.dropped,
         };
@@ -111,6 +137,12 @@ impl DatagramServiceStats {
             flow_expired: self.flow_expired.load(Ordering::Relaxed),
             flow_cleanup: self.flow_cleanup.load(Ordering::Relaxed),
             flow_table_full: self.flow_table_full.load(Ordering::Relaxed),
+            flow_socket_opened: self.flow_socket_opened.load(Ordering::Relaxed),
+            flow_socket_closed: self.flow_socket_closed.load(Ordering::Relaxed),
+            response_received: self.response_received.load(Ordering::Relaxed),
+            response_flow_missing: self.response_flow_missing.load(Ordering::Relaxed),
+            response_dropped: self.response_dropped.load(Ordering::Relaxed),
+            response_sent: self.response_sent.load(Ordering::Relaxed),
             truncated: self.truncated.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
         }
@@ -196,14 +228,52 @@ impl DatagramResponder {
     }
 }
 
+#[cfg(test)]
+fn datagram_test_responder(name: &str) -> DatagramResponder {
+    let listener = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .build()
+        .unwrap()
+        .block_on(UdpListener::bind("127.0.0.1:0"))
+        .unwrap();
+    DatagramResponder::new(
+        Arc::from(name),
+        Arc::new(listener),
+        Arc::new(DatagramServiceStats::default()),
+    )
+}
+
 /// A UDP forwarding application backed by upstream selection and flow affinity.
 #[derive(Debug)]
 pub struct UdpLoadBalancer {
     peers: Arc<UdpPeerSet>,
     selection_mode: UdpSelectionMode,
-    flow_table: Mutex<UdpFlowTable>,
+    flow_table: Arc<Mutex<UdpFlowTable>>,
+    flow_runtime: Arc<
+        Mutex<
+            std::collections::HashMap<
+                crate::protocols::l4::datagram::DatagramFlowKey,
+                UdpFlowRuntime,
+            >,
+        >,
+    >,
     cleanup_interval: Option<Duration>,
-    last_cleanup: Mutex<Option<std::time::Instant>>,
+    last_cleanup: Arc<Mutex<Option<std::time::Instant>>>,
+}
+
+// Reverse-path routing uses one connected upstream UDP socket per active flow so
+// backend responses can be associated with the correct client without relying on
+// protocol-specific correlation data.
+#[derive(Clone, Debug)]
+struct UdpFlowRuntime {
+    peer_addr: SocketAddr,
+    upstream_socket: Arc<UdpSocket>,
+    stop_tx: watch::Sender<bool>,
+}
+
+struct UdpForwardTarget {
+    flow_key: crate::protocols::l4::datagram::DatagramFlowKey,
+    peer: UdpPeer,
 }
 
 /// Service-level limits and behavior for UDP load balancing.
@@ -266,12 +336,13 @@ impl UdpLoadBalancer {
         Self {
             peers: Arc::new(UdpPeerSet::new(peers)),
             selection_mode,
-            flow_table: Mutex::new(UdpFlowTable::new(
+            flow_table: Arc::new(Mutex::new(UdpFlowTable::new(
                 options.idle_timeout,
                 options.max_tracked_flows,
-            )),
+            ))),
+            flow_runtime: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cleanup_interval: options.cleanup_interval,
-            last_cleanup: Mutex::new(None),
+            last_cleanup: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -291,31 +362,192 @@ impl UdpLoadBalancer {
             }
         }
 
-        let removed = self.flow_table.lock().cleanup_expired();
+        let expired_keys = self.flow_table.lock().cleanup_expired_keys();
         let mut last_cleanup = self.last_cleanup.lock();
         *last_cleanup = Some(now);
-        if removed > 0 {
+        let expired_count = expired_keys.len();
+        if expired_count > 0 {
+            self.remove_flow_runtime_entries(expired_keys, responder, "expired");
             responder.record_event(DatagramMetricEvent::FlowCleanup);
             debug!(
                 "UDP load balancer {} cleaned up {} expired flows",
                 responder.service_name(),
-                removed
+                expired_count
             );
         }
     }
 
-    fn select_peer_for_datagram(
+    fn remove_flow_runtime_entries(
+        &self,
+        flow_keys: Vec<crate::protocols::l4::datagram::DatagramFlowKey>,
+        responder: &DatagramResponder,
+        reason: &str,
+    ) {
+        let mut runtime = self.flow_runtime.lock();
+        for flow_key in flow_keys {
+            if let Some(entry) = runtime.remove(&flow_key) {
+                let _ = entry.stop_tx.send(true);
+                responder.record_event(DatagramMetricEvent::FlowSocketClosed);
+                debug!(
+                    "UDP load balancer {} closed upstream flow socket for {} due to {}",
+                    responder.service_name(),
+                    flow_key.peer_addr,
+                    reason
+                );
+            }
+        }
+    }
+
+    fn connected_upstream_socket(peer_addr: &SocketAddr) -> std::io::Result<UdpSocket> {
+        let SocketAddr::Inet(peer_addr) = peer_addr else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "UDP load balancer requires an Internet upstream address",
+            ));
+        };
+        let bind_addr = if peer_addr.is_ipv4() {
+            std::net::SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            std::net::SocketAddr::from(([0_u16; 8], 0))
+        };
+        let socket = std::net::UdpSocket::bind(bind_addr)?;
+        socket.connect(peer_addr)?;
+        socket.set_nonblocking(true)?;
+        UdpSocket::from_std(socket)
+    }
+
+    fn ensure_flow_runtime(
+        &self,
+        flow_key: &crate::protocols::l4::datagram::DatagramFlowKey,
+        peer: &UdpPeer,
+        responder: &DatagramResponder,
+        shutdown: &ShutdownWatch,
+    ) -> std::io::Result<Arc<UdpSocket>> {
+        if let Some(entry) = self.flow_runtime.lock().get(flow_key).cloned() {
+            if entry.peer_addr == *peer.address() {
+                return Ok(entry.upstream_socket);
+            }
+            self.remove_flow_runtime_entries(vec![flow_key.clone()], responder, "peer remap");
+        }
+
+        let socket = Arc::new(Self::connected_upstream_socket(peer.address())?);
+        let (stop_tx, stop_rx) = watch::channel(false);
+        self.flow_runtime.lock().insert(
+            flow_key.clone(),
+            UdpFlowRuntime {
+                peer_addr: peer.address().clone(),
+                upstream_socket: socket.clone(),
+                stop_tx,
+            },
+        );
+        responder.record_event(DatagramMetricEvent::FlowSocketOpened);
+        self.spawn_reverse_flow(
+            flow_key.clone(),
+            peer.address().clone(),
+            socket.clone(),
+            responder.clone(),
+            shutdown.clone(),
+            stop_rx,
+        );
+        Ok(socket)
+    }
+
+    fn spawn_reverse_flow(
+        &self,
+        flow_key: crate::protocols::l4::datagram::DatagramFlowKey,
+        peer_addr: SocketAddr,
+        socket: Arc<UdpSocket>,
+        responder: DatagramResponder,
+        mut shutdown: ShutdownWatch,
+        mut stop_rx: watch::Receiver<bool>,
+    ) {
+        let flow_table = self.flow_table.clone();
+        let flow_runtime = self.flow_runtime.clone();
+        pingora_runtime::current_handle().spawn(async move {
+            let mut buf = vec![0; u16::MAX as usize];
+            loop {
+                let next = tokio::select! {
+                    recv = socket.recv(&mut buf) => recv,
+                    changed = stop_rx.changed() => {
+                        match changed {
+                            Ok(()) if *stop_rx.borrow() => break,
+                            Ok(()) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                    changed = shutdown.changed() => {
+                        match changed {
+                            Ok(()) if *shutdown.borrow() => break,
+                            Ok(()) => continue,
+                            Err(_) => break,
+                        }
+                    }
+                };
+
+                let size = match next {
+                    Ok(size) => size,
+                    Err(e) => {
+                        responder.record_event(DatagramMetricEvent::RecvError);
+                        error!(
+                            "UDP load balancer {} failed reading upstream response from {}: {}",
+                            responder.service_name(),
+                            peer_addr,
+                            e
+                        );
+                        break;
+                    }
+                };
+
+                responder.record_event(DatagramMetricEvent::ResponseReceived);
+                let client_addr = {
+                    let mut table = flow_table.lock();
+                    match table.lookup(&flow_key) {
+                        UdpFlowLookup::Active(entry) if entry.peer.address() == &peer_addr => {
+                            flow_key.peer_addr.clone()
+                        }
+                        UdpFlowLookup::Active(_)
+                        | UdpFlowLookup::Missing
+                        | UdpFlowLookup::Expired => {
+                            flow_runtime.lock().remove(&flow_key);
+                            responder.record_event(DatagramMetricEvent::ResponseFlowMissing);
+                            debug!(
+                                "UDP load balancer {} dropped upstream response from {} because flow {} is no longer active",
+                                responder.service_name(),
+                                peer_addr,
+                                flow_key.peer_addr
+                            );
+                            break;
+                        }
+                    }
+                };
+
+                if let Err(e) = responder.send_to(&buf[..size], &client_addr).await {
+                    responder.record_event(DatagramMetricEvent::ResponseDropped);
+                    error!(
+                        "UDP load balancer {} failed routing upstream response from {} back to {}: {}",
+                        responder.service_name(),
+                        peer_addr,
+                        client_addr,
+                        e
+                    );
+                    continue;
+                }
+                responder.record_event(DatagramMetricEvent::ResponseSent);
+            }
+        });
+    }
+
+    fn select_route_for_datagram(
         &self,
         datagram: &Datagram,
         responder: &DatagramResponder,
-    ) -> Option<UdpPeer> {
+    ) -> Option<UdpForwardTarget> {
         self.maybe_cleanup_expired(responder);
 
         if self.peers.is_empty() {
             return None;
         }
 
-        // Responses from upstream peers are recognized but not forwarded back yet.
         if self.peers.contains_addr(&datagram.meta.peer_addr) {
             responder.record_event(DatagramMetricEvent::IgnoredUpstream);
             debug!(
@@ -334,30 +566,52 @@ impl UdpLoadBalancer {
         match flow_table.lookup(&flow_key) {
             UdpFlowLookup::Active(entry) => {
                 if self.peers.is_enabled(entry.peer.address()) {
-                    return Some(entry.peer.clone());
+                    return Some(UdpForwardTarget {
+                        flow_key,
+                        peer: entry.peer.clone(),
+                    });
                 }
                 let invalid_peer = entry.peer.address().clone();
-                let removed = flow_table.invalidate_peer(&invalid_peer);
+                let removed = flow_table.invalidate_peer_keys(&invalid_peer);
+                let removed_count = removed.len();
+                drop(flow_table);
+                self.remove_flow_runtime_entries(removed, responder, "peer disabled");
                 responder.record_event(DatagramMetricEvent::FlowRemap);
                 debug!(
                     "UDP load balancer {} remapping flow from disabled peer {} (removed {} entries)",
                     responder.service_name(),
                     invalid_peer,
-                    removed
+                    removed_count
                 );
+                let mut flow_table = self.flow_table.lock();
+                let peer = match self.peers.select(self.selection_mode, &flow_key) {
+                    Some(peer) => peer.clone(),
+                    None => return None,
+                };
+                match flow_table.upsert(flow_key.clone(), peer.clone()) {
+                    UdpFlowInsert::Inserted | UdpFlowInsert::Replaced => {}
+                    UdpFlowInsert::TableFull => {
+                        responder.record_event(DatagramMetricEvent::FlowTableFull);
+                        return None;
+                    }
+                }
+                return Some(UdpForwardTarget { flow_key, peer });
             }
             UdpFlowLookup::Expired => {
+                drop(flow_table);
+                self.remove_flow_runtime_entries(vec![flow_key.clone()], responder, "expired");
                 responder.record_event(DatagramMetricEvent::FlowExpired);
                 debug!(
                     "UDP load balancer {} expired idle flow",
                     responder.service_name()
                 );
+                flow_table = self.flow_table.lock();
             }
             UdpFlowLookup::Missing => {}
         }
 
-        let peer = self.peers.select(self.selection_mode, &flow_key)?.clone();
-        match flow_table.upsert(flow_key, peer.clone()) {
+        let peer = self.peers.select(self.selection_mode, &flow_key).cloned()?;
+        match flow_table.upsert(flow_key.clone(), peer.clone()) {
             UdpFlowInsert::Inserted | UdpFlowInsert::Replaced => {}
             UdpFlowInsert::TableFull => {
                 responder.record_event(DatagramMetricEvent::FlowTableFull);
@@ -368,7 +622,7 @@ impl UdpLoadBalancer {
                 return None;
             }
         }
-        Some(peer)
+        Some(UdpForwardTarget { flow_key, peer })
     }
 
     /// Enable or disable a backend address for future selection.
@@ -384,6 +638,13 @@ impl UdpLoadBalancer {
     #[cfg(test)]
     fn tracked_flows(&self) -> usize {
         self.flow_table.lock().len()
+    }
+
+    #[cfg(test)]
+    fn select_peer_for_datagram(&self, datagram: &Datagram, service_name: &str) -> Option<UdpPeer> {
+        let responder = datagram_test_responder(service_name);
+        self.select_route_for_datagram(datagram, &responder)
+            .map(|route| route.peer)
     }
 
     #[cfg(test)]
@@ -403,9 +664,11 @@ impl DatagramApp for UdpLoadBalancer {
         &self,
         datagram: Datagram,
         responder: &DatagramResponder,
-        _shutdown: &ShutdownWatch,
+        shutdown: &ShutdownWatch,
     ) {
-        let Some(peer) = self.select_peer_for_datagram(&datagram, responder) else {
+        let Some(UdpForwardTarget { flow_key, peer }) =
+            self.select_route_for_datagram(&datagram, responder)
+        else {
             responder.record_event(DatagramMetricEvent::Dropped);
             debug!(
                 "UDP load balancer {} dropped datagram from {}",
@@ -415,7 +678,23 @@ impl DatagramApp for UdpLoadBalancer {
             return;
         };
 
-        if let Err(e) = responder.send_to(datagram.payload(), peer.address()).await {
+        let upstream_socket = match self.ensure_flow_runtime(&flow_key, &peer, responder, shutdown)
+        {
+            Ok(socket) => socket,
+            Err(e) => {
+                responder.record_event(DatagramMetricEvent::SendError);
+                error!(
+                    "UDP load balancer {} failed opening upstream socket for flow {} -> {}: {}",
+                    responder.service_name(),
+                    flow_key.peer_addr,
+                    peer.address(),
+                    e
+                );
+                return;
+            }
+        };
+
+        if let Err(e) = upstream_socket.send(datagram.payload()).await {
             error!(
                 "UDP load balancer {} failed forwarding {} bytes from {} to {}: {}",
                 responder.service_name(),
@@ -424,6 +703,7 @@ impl DatagramApp for UdpLoadBalancer {
                 peer.address(),
                 e
             );
+            responder.record_event(DatagramMetricEvent::SendError);
         }
     }
 }
@@ -667,11 +947,7 @@ impl<A: DatagramApp + Send + Sync + 'static> ServiceTrait for Service<A> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        DatagramApp, DatagramResponder, DatagramServiceStats, Service, UdpLoadBalancer,
-        UdpLoadBalancerOptions,
-    };
-    use crate::protocols::l4::datagram::UdpListener;
+    use super::{DatagramApp, DatagramResponder, Service, UdpLoadBalancer, UdpLoadBalancerOptions};
     use crate::protocols::l4::datagram::{Datagram, DatagramMeta};
     use crate::protocols::l4::socket::SocketAddr;
     use crate::server::ShutdownWatch;
@@ -679,7 +955,6 @@ mod tests {
     use crate::upstreams::peer::UdpPeer;
     use crate::upstreams::udp::UdpSelectionMode;
     use async_trait::async_trait;
-    use std::sync::Arc;
     use std::time::Duration as StdDuration;
     use tokio::net::UdpSocket;
     use tokio::sync::watch;
@@ -697,20 +972,6 @@ mod tests {
         ) {
             let _ = responder.send_datagram(&datagram).await;
         }
-    }
-
-    fn test_responder(name: &str) -> DatagramResponder {
-        let listener = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap()
-            .block_on(UdpListener::bind("127.0.0.1:0"))
-            .unwrap();
-        DatagramResponder::new(
-            Arc::from(name),
-            Arc::new(listener),
-            Arc::new(DatagramServiceStats::default()),
-        )
     }
 
     #[test]
@@ -742,15 +1003,13 @@ mod tests {
             },
             b"hello".to_vec(),
         );
-        let responder = test_responder("udp-lb");
-
         let first = app
-            .select_peer_for_datagram(&datagram, &responder)
+            .select_peer_for_datagram(&datagram, "udp-lb")
             .unwrap()
             .address()
             .clone();
         let second = app
-            .select_peer_for_datagram(&datagram, &responder)
+            .select_peer_for_datagram(&datagram, "udp-lb")
             .unwrap()
             .address()
             .clone();
@@ -773,10 +1032,8 @@ mod tests {
             },
             b"response".to_vec(),
         );
-        let responder = test_responder("udp-lb");
-
         assert!(app
-            .select_peer_for_datagram(&backend_datagram, &responder)
+            .select_peer_for_datagram(&backend_datagram, "udp-lb")
             .is_none());
         assert_eq!(app.tracked_flows(), 0);
     }
@@ -798,10 +1055,8 @@ mod tests {
             },
             b"hello".to_vec(),
         );
-        let responder = test_responder("udp-lb");
-
         let first = app
-            .select_peer_for_datagram(&datagram, &responder)
+            .select_peer_for_datagram(&datagram, "udp-lb")
             .unwrap()
             .address()
             .clone();
@@ -809,7 +1064,7 @@ mod tests {
         assert!(!app.is_peer_enabled(&first));
 
         let second = app
-            .select_peer_for_datagram(&datagram, &responder)
+            .select_peer_for_datagram(&datagram, "udp-lb")
             .unwrap()
             .address()
             .clone();
@@ -846,11 +1101,9 @@ mod tests {
             },
             b"second".to_vec(),
         );
-        let responder = test_responder("udp-lb");
-
         assert_eq!(app.max_tracked_flows(), 1);
-        assert!(app.select_peer_for_datagram(&flow_a, &responder).is_some());
-        assert!(app.select_peer_for_datagram(&flow_b, &responder).is_none());
+        assert!(app.select_peer_for_datagram(&flow_a, "udp-lb").is_some());
+        assert!(app.select_peer_for_datagram(&flow_b, "udp-lb").is_none());
         assert_eq!(app.tracked_flows(), 1);
     }
 
@@ -879,15 +1132,13 @@ mod tests {
             },
             b"second".to_vec(),
         );
-        let responder = test_responder("udp-lb");
-
         assert_eq!(app.flow_idle_timeout(), StdDuration::from_millis(10));
-        assert!(app.select_peer_for_datagram(&flow_a, &responder).is_some());
+        assert!(app.select_peer_for_datagram(&flow_a, "udp-lb").is_some());
         assert_eq!(app.tracked_flows(), 1);
 
         std::thread::sleep(StdDuration::from_millis(20));
 
-        assert!(app.select_peer_for_datagram(&flow_b, &responder).is_some());
+        assert!(app.select_peer_for_datagram(&flow_b, "udp-lb").is_some());
         assert_eq!(app.tracked_flows(), 1);
     }
 
@@ -942,7 +1193,7 @@ mod tests {
 
         let mut service = Service::new("udp-echo".to_string(), EchoApp);
         service.add_udp(&listen_addr);
-        service.max_datagram_size = 4;
+        service.set_max_datagram_size(4);
 
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
@@ -966,6 +1217,125 @@ mod tests {
         timeout(Duration::from_secs(1), service_handle)
             .await
             .expect("timed out waiting for UDP service shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_load_balancer_routes_backend_responses_to_client() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{port}");
+
+        let mut service = Service::new(
+            "udp-lb".to_string(),
+            UdpLoadBalancer::new(
+                vec![UdpPeer::new(backend_addr.to_string().as_str())],
+                UdpSelectionMode::FlowHash,
+                StdDuration::from_secs(30),
+            ),
+        );
+        service.add_udp(&listen_addr);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let service_handle = tokio::spawn(async move {
+            #[cfg(unix)]
+            ServiceTrait::start_service(&mut service, None, shutdown_rx, 1).await;
+            #[cfg(windows)]
+            ServiceTrait::start_service(&mut service, shutdown_rx, 1).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", &listen_addr).await.unwrap();
+
+        let mut backend_buf = [0; 32];
+        let (size, upstream_addr) =
+            timeout(Duration::from_secs(1), backend.recv_from(&mut backend_buf))
+                .await
+                .expect("timed out waiting for forwarded datagram")
+                .unwrap();
+        assert_eq!(&backend_buf[..size], b"ping");
+
+        backend.send_to(b"pong", upstream_addr).await.unwrap();
+
+        let mut client_buf = [0; 32];
+        let (size, _) = timeout(Duration::from_secs(1), client.recv_from(&mut client_buf))
+            .await
+            .expect("timed out waiting for routed backend response")
+            .unwrap();
+        assert_eq!(&client_buf[..size], b"pong");
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), service_handle)
+            .await
+            .expect("timed out waiting for UDP load balancer shutdown")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn udp_load_balancer_drops_backend_responses_for_expired_flows() {
+        let backend = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let backend_addr = backend.local_addr().unwrap();
+
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let listen_addr = format!("127.0.0.1:{port}");
+
+        let mut service = Service::new(
+            "udp-lb".to_string(),
+            UdpLoadBalancer::new(
+                vec![UdpPeer::new(backend_addr.to_string().as_str())],
+                UdpSelectionMode::FlowHash,
+                StdDuration::from_millis(50),
+            ),
+        );
+        service.add_udp(&listen_addr);
+
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let service_handle = tokio::spawn(async move {
+            #[cfg(unix)]
+            ServiceTrait::start_service(&mut service, None, shutdown_rx, 1).await;
+            #[cfg(windows)]
+            ServiceTrait::start_service(&mut service, shutdown_rx, 1).await;
+        });
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.send_to(b"ping", &listen_addr).await.unwrap();
+
+        let mut backend_buf = [0; 32];
+        let (_, upstream_addr) =
+            timeout(Duration::from_secs(1), backend.recv_from(&mut backend_buf))
+                .await
+                .expect("timed out waiting for forwarded datagram")
+                .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        backend.send_to(b"late", upstream_addr).await.unwrap();
+
+        let mut client_buf = [0; 32];
+        let received = timeout(
+            Duration::from_millis(200),
+            client.recv_from(&mut client_buf),
+        )
+        .await;
+        assert!(received.is_err(), "expired flow response should be dropped");
+
+        shutdown_tx.send(true).unwrap();
+        timeout(Duration::from_secs(1), service_handle)
+            .await
+            .expect("timed out waiting for UDP load balancer shutdown")
             .unwrap();
     }
 
