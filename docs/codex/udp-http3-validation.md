@@ -3,6 +3,9 @@
 This note tracks the intentionally narrow validation surface added for the UDP,
 QUIC, and HTTP/3 milestones.
 
+For the current external-peer validation plan, see
+[HTTP/3 Interoperability Matrix](http3-interop-matrix.md).
+
 ## Benchmarks
 
 The current benchmark set is deliberately small and focused on the new hot paths:
@@ -15,6 +18,7 @@ What they cover:
 
 - UDP flow selection and flow-table lookup/update behavior
 - QUIC upstream establish vs pooled reuse behavior
+- QUIC upstream prune/retirement behavior
 - HTTP/3 request bridging from accepted QUIC streams into Pingora request headers
 - HTTP/3 upstream peer-to-connector mapping, pooled request execution, and retry outcome wiring
 - bidirectional UDP request/response routing is covered by service-layer runtime tests

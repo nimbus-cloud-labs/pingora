@@ -3,6 +3,24 @@
 Pingora now has a feature-gated QUIC and HTTP/3 foundation, but it is not yet a
 fully production-ready end-to-end HTTP/3 proxy.
 
+## Support Status
+
+Treat the current surface like this:
+
+- Supported foundation:
+  - UDP forwarding path
+  - real QUIC transport boundary on the selected backend path
+  - downstream HTTP/3 request/response bridge
+  - upstream HTTP/3 request execution against controlled origins
+- Experimental:
+  - external interoperability beyond the documented matrix
+  - production operational tuning across all environments
+- Intentionally unsupported today:
+  - upstream request trailers
+  - upstream response trailers
+  - downstream request trailers
+  - extension-heavy HTTP/3 paths outside the current request/response model
+
 What exists today:
 
 - downstream HTTP/3 negotiation and `alt-svc` advertisement
@@ -109,6 +127,9 @@ Current upstream HTTP/3 limits are still conservative:
 - upstream request trailers are not modeled yet
 - upstream response trailers are not surfaced by the current boundary and must be treated as unsupported
 
+See [docs/codex/http3-interop-matrix.md](/home/alekitto/projects/pingora/docs/codex/http3-interop-matrix.md)
+for the current external-peer validation plan.
+
 ## QUIC Session Reuse
 
 Pingora keeps QUIC upstream reuse separate from TCP connection pools.
@@ -165,6 +186,7 @@ The QUIC transport layer keeps lifecycle counters through:
 If you want those values in Prometheus, bridge the snapshots into application metrics
 using the same pattern shown in [Prometheus](prom.md).
 - `pool`
+- `h3_pool`
 
 See [Prometheus](prom.md) for the generic metrics setup.
 
