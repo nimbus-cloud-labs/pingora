@@ -22,6 +22,7 @@ parking_lot = "0.12"
 pingora-core = { version = "0.8.0", path = "../pingora-core", default-features = false }
 pingora-error = { version = "0.8.0", path = "../pingora-error" }
 tokio = { workspace = true, features = ["rt", "time"] }
+tokio-stream = { version = "0.1", optional = true }
 tokio-quiche = { version = "0.16.1", optional = true }
 
 [dev-dependencies]
@@ -33,4 +34,4 @@ harness = false
 
 [features]
 default = []
-tokio-quiche = ["dep:tokio-quiche"]
+tokio-quiche = ["dep:tokio-quiche", "dep:tokio-stream", "tokio/sync"]

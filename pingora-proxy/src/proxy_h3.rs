@@ -520,6 +520,7 @@ mod tests {
                     established_at: Instant::now(),
                     last_seen: Instant::now(),
                     packets_received: 1,
+                    stream_handle: None,
                 },
                 datagram: Datagram::new(
                     DatagramMeta {

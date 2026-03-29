@@ -113,7 +113,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 9
 
-### Task 9.1
+### [Implemented] Task 9.1
 
 Concise, user-visible summary of the fix
 
@@ -132,7 +132,7 @@ Provide just enough context for the assignee to pinpoint the code.
 - Current QUIC crate: `pingora-quic/src/lib.rs`
 - QUIC strategy note: `docs/codex/quic-integration-strategy.md`
 
-### Task 9.2
+### [Implemented] Task 9.2
 
 Concise, user-visible summary of the fix
 
@@ -151,7 +151,7 @@ Provide just enough context for the assignee to pinpoint the code.
 - Current downstream QUIC listener: `pingora-quic/src/lib.rs`
 - Existing UDP datagram primitives: `pingora-core/src/protocols/l4/datagram.rs`
 
-### Task 9.3
+### [Implemented] Task 9.3
 
 Concise, user-visible summary of the fix
 
@@ -170,7 +170,7 @@ Provide just enough context for the assignee to pinpoint the code.
 - Current connector and pool logic: `pingora-quic/src/lib.rs`
 - Current upstream HTTP/3 peer model: `pingora-core/src/upstreams/peer.rs`
 
-### Task 9.4
+### [Implemented] Task 9.4
 
 Concise, user-visible summary of the fix
 
@@ -189,7 +189,7 @@ Provide just enough context for the assignee to pinpoint the code.
 - Current downstream bridge assumptions: `pingora-proxy/src/proxy_h3.rs`
 - Current QUIC listener/session types: `pingora-quic/src/lib.rs`
 
-### Task 9.5
+### [Implemented] Task 9.5
 
 Concise, user-visible summary of the fix
 
