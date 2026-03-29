@@ -17,6 +17,8 @@ What they cover:
 - QUIC upstream establish vs pooled reuse behavior
 - HTTP/3 request bridging from accepted QUIC streams into Pingora request headers
 - bidirectional UDP request/response routing is covered by service-layer runtime tests
+- tokio-quiche runtime handshake and basic QUIC stream exchange are covered by
+  feature-gated `pingora-quic` tests
 
 ## Build Validation Matrix
 
@@ -25,13 +27,20 @@ The current implementation has been kept build-validated across these feature se
 - `cargo test -p pingora-quic --lib --no-run`
 - `cargo test -p pingora-quic --lib --no-run --features tokio-quiche`
 - `cargo test -p pingora-proxy --lib --no-run --features http3`
-- `cargo test -p pingora --lib --no-run --features http3`
+- `cargo test -p pingora --lib --no-run --features quic,http3`
 - `cargo check -p pingora-proxy --example http3_proxy --features http3`
 
 The UDP service layer also contains runtime tests for:
 
 - backend response routing to the original client
 - dropping backend responses after flow expiration
+
+The QUIC crate now also contains feature-gated runtime tests for:
+
+- downstream tokio-quiche handshake acceptance
+- upstream tokio-quiche session establishment
+- basic bidirectional QUIC stream event delivery
+- pooled reuse of real upstream QUIC sessions
 
 Those tests are logically part of the validation surface, but may still be
 blocked in restricted sandboxes that deny local UDP `connect()` on ephemeral

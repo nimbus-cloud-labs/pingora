@@ -34,6 +34,42 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use tokio::sync::{mpsc, Mutex as AsyncMutex};
+
+/// Certificate formats supported by QUIC transport backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuicCertificateKind {
+    /// Standard X.509 certificate and private key pair.
+    X509,
+    /// Raw public key certificate material.
+    RawPublicKey,
+}
+
+/// TLS credentials used by QUIC transport backends.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct QuicTlsCertificate {
+    /// Path to the certificate file.
+    pub cert_path: String,
+    /// Path to the private key file.
+    pub private_key_path: String,
+    /// Certificate format expected by the QUIC backend.
+    pub kind: QuicCertificateKind,
+}
+
+impl QuicTlsCertificate {
+    /// Create TLS credentials for a QUIC listener or connector.
+    pub fn new(
+        cert_path: impl Into<String>,
+        private_key_path: impl Into<String>,
+        kind: QuicCertificateKind,
+    ) -> Self {
+        Self {
+            cert_path: cert_path.into(),
+            private_key_path: private_key_path.into(),
+            kind,
+        }
+    }
+}
 
 /// Listener configuration for downstream QUIC traffic.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +86,8 @@ pub struct QuicListenerConfig {
     pub max_concurrent_bidi_streams: u64,
     /// Maximum UDP datagram size to receive for this listener.
     pub max_datagram_size: usize,
+    /// TLS credentials required by real QUIC server backends.
+    pub tls_certificate: Option<QuicTlsCertificate>,
 }
 
 impl QuicListenerConfig {
@@ -62,6 +100,7 @@ impl QuicListenerConfig {
             max_idle_timeout: Duration::from_secs(30),
             max_concurrent_bidi_streams: 128,
             max_datagram_size: 1350,
+            tls_certificate: None,
         }
     }
 
@@ -86,6 +125,12 @@ impl QuicListenerConfig {
     /// Override the datagram receive buffer size.
     pub fn with_max_datagram_size(mut self, max_datagram_size: usize) -> Self {
         self.max_datagram_size = max_datagram_size;
+        self
+    }
+
+    /// Override the TLS credentials used by real QUIC server backends.
+    pub fn with_tls_certificate(mut self, tls_certificate: Option<QuicTlsCertificate>) -> Self {
+        self.tls_certificate = tls_certificate;
         self
     }
 
@@ -126,6 +171,10 @@ pub struct QuicConnectorConfig {
     pub connect_timeout: Duration,
     /// Maximum idle time before a pooled upstream session expires.
     pub idle_timeout: Duration,
+    /// Optional client certificate used for mTLS-capable QUIC backends.
+    pub client_certificate: Option<QuicTlsCertificate>,
+    /// Whether the backend should verify the peer certificate.
+    pub verify_peer: bool,
 }
 
 impl QuicConnectorConfig {
@@ -139,6 +188,8 @@ impl QuicConnectorConfig {
             alpn_protocols: Vec::new(),
             connect_timeout: Duration::from_secs(10),
             idle_timeout: Duration::from_secs(30),
+            client_certificate: None,
+            verify_peer: false,
         }
     }
 
@@ -169,6 +220,21 @@ impl QuicConnectorConfig {
     /// Override the idle timeout used by the upstream session pool.
     pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
         self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Override the client certificate used for mTLS-capable QUIC backends.
+    pub fn with_client_certificate(
+        mut self,
+        client_certificate: Option<QuicTlsCertificate>,
+    ) -> Self {
+        self.client_certificate = client_certificate;
+        self
+    }
+
+    /// Override whether the QUIC backend verifies the peer certificate.
+    pub fn with_verify_peer(mut self, verify_peer: bool) -> Self {
+        self.verify_peer = verify_peer;
         self
     }
 
@@ -220,6 +286,139 @@ pub struct QuicConnectionMeta {
     pub resumed: bool,
 }
 
+/// Stream direction used by transport-level shutdown commands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicStreamDirection {
+    /// Shutdown the read side of the QUIC stream.
+    Read,
+    /// Shutdown the write side of the QUIC stream.
+    Write,
+}
+
+/// Transport-level QUIC stream lifecycle event, independent from HTTP semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuicStreamEvent {
+    /// A stream was first observed on this QUIC session.
+    Opened { stream_id: u64 },
+    /// Stream payload bytes were received.
+    Data {
+        stream_id: u64,
+        data: Vec<u8>,
+        fin: bool,
+    },
+    /// The peer finished sending data on the stream.
+    Finished { stream_id: u64 },
+    /// The peer reset or stopped the stream.
+    Reset { stream_id: u64, error_code: u64 },
+    /// The stream is writable for locally queued data.
+    Writable { stream_id: u64 },
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "tokio-quiche"), allow(dead_code))]
+enum QuicStreamCommand {
+    Send {
+        stream_id: u64,
+        data: Vec<u8>,
+        fin: bool,
+    },
+    Shutdown {
+        stream_id: u64,
+        direction: QuicStreamDirection,
+        error_code: u64,
+    },
+}
+
+#[derive(Debug)]
+#[cfg_attr(not(feature = "tokio-quiche"), allow(dead_code))]
+struct QuicStreamController {
+    cmd_tx: mpsc::UnboundedSender<QuicStreamCommand>,
+    event_rx: AsyncMutex<mpsc::UnboundedReceiver<QuicStreamEvent>>,
+}
+
+/// Handle for transport-level QUIC stream operations on a live session.
+#[derive(Debug, Clone)]
+pub struct QuicStreamHandle {
+    controller: Arc<QuicStreamController>,
+}
+
+impl QuicStreamHandle {
+    #[cfg_attr(not(feature = "tokio-quiche"), allow(dead_code))]
+    fn new(controller: Arc<QuicStreamController>) -> Self {
+        Self { controller }
+    }
+
+    async fn recv_stream_event(&self) -> Option<QuicStreamEvent> {
+        self.controller.recv_stream_event().await
+    }
+
+    fn send_stream_data(&self, stream_id: u64, data: Vec<u8>, fin: bool) -> Result<()> {
+        self.controller.send_stream_data(stream_id, data, fin)
+    }
+
+    fn shutdown_stream(
+        &self,
+        stream_id: u64,
+        direction: QuicStreamDirection,
+        error_code: u64,
+    ) -> Result<()> {
+        self.controller
+            .shutdown_stream(stream_id, direction, error_code)
+    }
+}
+
+impl QuicStreamController {
+    #[cfg_attr(not(feature = "tokio-quiche"), allow(dead_code))]
+    fn new(
+        cmd_tx: mpsc::UnboundedSender<QuicStreamCommand>,
+        event_rx: mpsc::UnboundedReceiver<QuicStreamEvent>,
+    ) -> Self {
+        Self {
+            cmd_tx,
+            event_rx: AsyncMutex::new(event_rx),
+        }
+    }
+
+    async fn recv_stream_event(&self) -> Option<QuicStreamEvent> {
+        self.event_rx.lock().await.recv().await
+    }
+
+    fn send_stream_data(&self, stream_id: u64, data: Vec<u8>, fin: bool) -> Result<()> {
+        self.cmd_tx
+            .send(QuicStreamCommand::Send {
+                stream_id,
+                data,
+                fin,
+            })
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "QUIC session closed before stream data could be queued",
+                )
+            })
+    }
+
+    fn shutdown_stream(
+        &self,
+        stream_id: u64,
+        direction: QuicStreamDirection,
+        error_code: u64,
+    ) -> Result<()> {
+        self.cmd_tx
+            .send(QuicStreamCommand::Shutdown {
+                stream_id,
+                direction,
+                error_code,
+            })
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "QUIC session closed before stream shutdown could be queued",
+                )
+            })
+    }
+}
+
 /// A transport-oriented representation of a QUIC upstream destination.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct QuicUpstreamDestination {
@@ -235,6 +434,8 @@ pub struct QuicUpstreamDestination {
     pub alpn_protocols: Vec<Vec<u8>>,
     /// Maximum idle time before a pooled upstream session expires.
     pub idle_timeout: Duration,
+    /// Whether the upstream backend verifies the peer certificate.
+    pub verify_peer: bool,
 }
 
 impl From<&QuicConnectorConfig> for QuicUpstreamDestination {
@@ -246,6 +447,7 @@ impl From<&QuicConnectorConfig> for QuicUpstreamDestination {
             server_name: config.server_name.clone(),
             alpn_protocols: config.alpn_protocols.clone(),
             idle_timeout: config.idle_timeout,
+            verify_peer: config.verify_peer,
         }
     }
 }
@@ -263,6 +465,48 @@ pub struct QuicDownstreamSession {
     pub last_seen: Instant,
     /// Number of datagrams observed on this session.
     pub packets_received: u64,
+    /// Stream lifecycle controller for real QUIC backends, when available.
+    #[doc(hidden)]
+    pub stream_handle: Option<QuicStreamHandle>,
+}
+
+impl QuicDownstreamSession {
+    /// Receive the next QUIC stream event for this session, if supported.
+    pub async fn recv_stream_event(&self) -> Option<QuicStreamEvent> {
+        let handle = self.stream_handle.as_ref()?;
+        handle.recv_stream_event().await
+    }
+
+    /// Queue data to be sent on a QUIC stream for this session.
+    pub fn send_stream_data(&self, stream_id: u64, data: Vec<u8>, fin: bool) -> Result<()> {
+        self.stream_handle
+            .as_ref()
+            .ok_or_else(|| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    "QUIC stream sending is unavailable on this session backend",
+                )
+            })?
+            .send_stream_data(stream_id, data, fin)
+    }
+
+    /// Queue a stream shutdown for this session.
+    pub fn shutdown_stream(
+        &self,
+        stream_id: u64,
+        direction: QuicStreamDirection,
+        error_code: u64,
+    ) -> Result<()> {
+        self.stream_handle
+            .as_ref()
+            .ok_or_else(|| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    "QUIC stream shutdown is unavailable on this session backend",
+                )
+            })?
+            .shutdown_stream(stream_id, direction, error_code)
+    }
 }
 
 /// Event emitted by the downstream listener for a received QUIC datagram.
@@ -274,6 +518,15 @@ pub enum QuicSessionEvent {
     Reused,
 }
 
+/// QUIC transport backend used by a listener or connector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuicBackend {
+    /// Pingora's placeholder UDP-backed QUIC model.
+    Noop,
+    /// `tokio-quiche` backed QUIC transport.
+    TokioQuiche,
+}
+
 /// A datagram associated with a downstream QUIC session.
 #[derive(Debug, Clone)]
 pub struct QuicIncomingDatagram {
@@ -283,6 +536,21 @@ pub struct QuicIncomingDatagram {
     pub datagram: Datagram,
     /// Whether the session was newly accepted or reused.
     pub event: QuicSessionEvent,
+}
+
+/// Downstream session close event surfaced by real QUIC backends.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuicDownstreamCloseEvent {
+    /// Listener-scoped flow key for the closed session.
+    pub flow_key: DatagramFlowKey,
+    /// Local UDP address of the closed session.
+    pub local_addr: SocketAddr,
+    /// Remote peer address of the closed session.
+    pub peer_addr: SocketAddr,
+    /// QUIC backend that emitted this event.
+    pub backend: QuicBackend,
+    /// Human-readable close reason.
+    pub reason: String,
 }
 
 /// Snapshot of lifecycle counters for a downstream QUIC listener.
@@ -298,6 +566,10 @@ pub struct QuicListenerStats {
     pub dropped_datagrams: u64,
     /// Number of datagrams consumed by the listener.
     pub received_datagrams: u64,
+    /// Number of downstream handshakes that failed before session acceptance.
+    pub handshake_failures: u64,
+    /// Number of accepted downstream sessions later observed as closed.
+    pub closed_sessions: u64,
 }
 
 #[derive(Debug, Default)]
@@ -307,6 +579,8 @@ struct QuicListenerStatsInner {
     expired_sessions: AtomicU64,
     dropped_datagrams: AtomicU64,
     received_datagrams: AtomicU64,
+    handshake_failures: AtomicU64,
+    closed_sessions: AtomicU64,
 }
 
 impl QuicListenerStatsInner {
@@ -317,6 +591,8 @@ impl QuicListenerStatsInner {
             expired_sessions: self.expired_sessions.load(Ordering::Relaxed),
             dropped_datagrams: self.dropped_datagrams.load(Ordering::Relaxed),
             received_datagrams: self.received_datagrams.load(Ordering::Relaxed),
+            handshake_failures: self.handshake_failures.load(Ordering::Relaxed),
+            closed_sessions: self.closed_sessions.load(Ordering::Relaxed),
         }
     }
 }
@@ -386,6 +662,11 @@ impl QuicDownstreamListener {
     /// Borrow the configuration used for this listener.
     pub fn config(&self) -> &QuicListenerConfig {
         &self.config
+    }
+
+    /// Return the transport backend used by this listener.
+    pub fn backend(&self) -> QuicBackend {
+        QuicBackend::Noop
     }
 
     /// Return the bound local address of the underlying UDP listener.
@@ -465,6 +746,7 @@ impl QuicDownstreamListener {
             established_at: now,
             last_seen: now,
             packets_received: 1,
+            stream_handle: None,
         };
         sessions.insert(flow_key, session.clone());
         self.stats.accepted_sessions.fetch_add(1, Ordering::Relaxed);
@@ -506,15 +788,22 @@ impl QuicDownstreamListener {
 #[derive(Debug)]
 pub struct QuicConnectorHandle {
     config: QuicConnectorConfig,
+    backend: QuicBackend,
     stats: QuicConnectorStatsInner,
 }
 
 impl QuicConnectorHandle {
     /// Create a connector handle from validated configuration.
     pub fn new(config: QuicConnectorConfig) -> Result<Self> {
+        Self::new_with_backend(config, QuicBackend::Noop)
+    }
+
+    /// Create a connector handle from validated configuration and backend identity.
+    pub fn new_with_backend(config: QuicConnectorConfig, backend: QuicBackend) -> Result<Self> {
         config.validate()?;
         Ok(Self {
             config,
+            backend,
             stats: QuicConnectorStatsInner::default(),
         })
     }
@@ -522,6 +811,11 @@ impl QuicConnectorHandle {
     /// Borrow the configuration used to create the handle.
     pub fn config(&self) -> &QuicConnectorConfig {
         &self.config
+    }
+
+    /// Return the transport backend used by this connector.
+    pub fn backend(&self) -> QuicBackend {
+        self.backend
     }
 
     /// Return a snapshot of connector lifecycle counters.
@@ -543,6 +837,11 @@ impl QuicConnectorHandle {
         &self,
         handshake_delay: Duration,
     ) -> Result<QuicUpstreamSession> {
+        #[cfg(feature = "tokio-quiche")]
+        if self.backend == QuicBackend::TokioQuiche {
+            return establish_tokio_quiche_upstream(&self.config, &self.stats).await;
+        }
+
         if let Err(error) = self.config.validate() {
             self.stats
                 .handshake_failures
@@ -615,12 +914,13 @@ impl QuicConnectorHandle {
             idle_timeout: self.config.idle_timeout,
             last_used_at: established_at,
             reuse_count: 0,
+            stream_handle: None,
         })
     }
 }
 
 /// A transport-level QUIC upstream session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct QuicUpstreamSession {
     /// The upstream destination used to create the session.
     pub destination: QuicUpstreamDestination,
@@ -636,6 +936,48 @@ pub struct QuicUpstreamSession {
     pub last_used_at: Instant,
     /// Number of times this session has been reused after the initial establishment.
     pub reuse_count: u64,
+    /// Stream lifecycle controller for real QUIC backends, when available.
+    #[doc(hidden)]
+    pub stream_handle: Option<QuicStreamHandle>,
+}
+
+impl QuicUpstreamSession {
+    /// Receive the next QUIC stream event for this session, if supported.
+    pub async fn recv_stream_event(&self) -> Option<QuicStreamEvent> {
+        let handle = self.stream_handle.as_ref()?;
+        handle.recv_stream_event().await
+    }
+
+    /// Queue data to be sent on a QUIC stream for this session.
+    pub fn send_stream_data(&self, stream_id: u64, data: Vec<u8>, fin: bool) -> Result<()> {
+        self.stream_handle
+            .as_ref()
+            .ok_or_else(|| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    "QUIC stream sending is unavailable on this session backend",
+                )
+            })?
+            .send_stream_data(stream_id, data, fin)
+    }
+
+    /// Queue a stream shutdown for this session.
+    pub fn shutdown_stream(
+        &self,
+        stream_id: u64,
+        direction: QuicStreamDirection,
+        error_code: u64,
+    ) -> Result<()> {
+        self.stream_handle
+            .as_ref()
+            .ok_or_else(|| {
+                Error::explain(
+                    ErrorType::InternalError,
+                    "QUIC stream shutdown is unavailable on this session backend",
+                )
+            })?
+            .shutdown_stream(stream_id, direction, error_code)
+    }
 }
 
 /// Snapshot of lifecycle counters for the QUIC upstream session pool.
@@ -825,53 +1167,710 @@ impl QuicTransport for NoopQuicTransport {
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio-quiche")))]
 pub mod tokio_quiche_adapter {
     use super::{
-        QuicConnectorConfig, QuicConnectorHandle, QuicDownstreamListener, QuicListenerConfig,
-        QuicTransport, Result,
+        default_local_addr_for, observe_quic_event, QuicBackend, QuicCertificateKind,
+        QuicConnectionMeta, QuicConnectorConfig, QuicConnectorHandle, QuicDownstreamCloseEvent,
+        QuicDownstreamSession, QuicListenerConfig, QuicListenerStats, QuicListenerStatsInner,
+        QuicStreamCommand, QuicStreamController, QuicStreamDirection, QuicStreamEvent,
+        QuicStreamHandle,
+        QuicTlsCertificate, QuicTransport, QuicUpstreamSession, Result,
     };
     use async_trait::async_trait;
+    use parking_lot::Mutex;
+    use pingora_core::protocols::l4::datagram::DatagramMeta;
+    use pingora_core::protocols::l4::socket::SocketAddr;
+    use pingora_error::{Error, ErrorType};
+    use std::collections::{HashMap, HashSet, VecDeque};
+    use std::future::pending;
+    use std::sync::atomic::Ordering;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::net::UdpSocket;
+    use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
+    use tokio::time::timeout;
+    use tokio_quiche::quic::connect_with_config;
+    use tokio_quiche::metrics::DefaultMetrics;
+    use tokio_quiche::socket::Socket as ConnectedSocket;
+    use tokio_quiche::settings::{
+        CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
+    };
+    use tokio_stream::StreamExt;
 
-    /// Feature-gated QUIC transport adapter backed by `tokio-quiche`.
-    #[derive(Debug)]
-    pub struct TokioQuicheTransport {
-        params: tokio_quiche::ConnectionParams<'static>,
+    #[derive(Debug, Clone, Default)]
+    struct NegotiatedMetadata {
+        alpn_protocol: Option<Vec<u8>>,
+        server_name: Option<String>,
     }
 
-    impl TokioQuicheTransport {
-        /// Create a new adapter with default `tokio-quiche` connection parameters.
-        pub fn new() -> Self {
+    struct StreamRuntime {
+        event_tx: mpsc::UnboundedSender<QuicStreamEvent>,
+        cmd_rx: mpsc::UnboundedReceiver<QuicStreamCommand>,
+        pending_commands: VecDeque<QuicStreamCommand>,
+        seen_streams: HashSet<u64>,
+        writable_streams: HashSet<u64>,
+        buffer: Vec<u8>,
+    }
+
+    impl StreamRuntime {
+        fn new(
+            cmd_rx: mpsc::UnboundedReceiver<QuicStreamCommand>,
+            event_tx: mpsc::UnboundedSender<QuicStreamEvent>,
+            max_datagram_size: usize,
+        ) -> Self {
             Self {
-                params: tokio_quiche::ConnectionParams::default(),
+                event_tx,
+                cmd_rx,
+                pending_commands: VecDeque::new(),
+                seen_streams: HashSet::new(),
+                writable_streams: HashSet::new(),
+                buffer: vec![0; max_datagram_size.max(4096)],
             }
+        }
+
+        fn emit_read_events(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+        ) -> tokio_quiche::QuicResult<()> {
+            for stream_id in qconn.readable() {
+                if self.seen_streams.insert(stream_id) {
+                    let _ = self.event_tx.send(QuicStreamEvent::Opened { stream_id });
+                }
+
+                loop {
+                    match qconn.stream_recv(stream_id, &mut self.buffer) {
+                        Ok((read, fin)) => {
+                            let _ = self.event_tx.send(QuicStreamEvent::Data {
+                                stream_id,
+                                data: self.buffer[..read].to_vec(),
+                                fin,
+                            });
+                            if fin || qconn.stream_finished(stream_id) {
+                                let _ = self.event_tx.send(QuicStreamEvent::Finished { stream_id });
+                            }
+                        }
+                        Err(tokio_quiche::quiche::Error::Done) => break,
+                        Err(tokio_quiche::quiche::Error::StreamReset(error_code)) => {
+                            let _ = self.event_tx.send(QuicStreamEvent::Reset {
+                                stream_id,
+                                error_code,
+                            });
+                            break;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+            }
+
+            Ok(())
+        }
+
+        fn enqueue_writable_events(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+        ) {
+            for stream_id in qconn.writable() {
+                if self.writable_streams.insert(stream_id) {
+                    let _ = self.event_tx.send(QuicStreamEvent::Writable { stream_id });
+                }
+            }
+        }
+
+        fn queue_command(&mut self, command: QuicStreamCommand) {
+            self.pending_commands.push_back(command);
+        }
+
+        fn drain_pending_commands(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+        ) -> tokio_quiche::QuicResult<()> {
+            while let Some(command) = self.pending_commands.pop_front() {
+                match command {
+                    QuicStreamCommand::Send {
+                        stream_id,
+                        data,
+                        fin,
+                    } => match qconn.stream_send(stream_id, &data, fin) {
+                        Ok(_) => {
+                            self.seen_streams.insert(stream_id);
+                            self.writable_streams.remove(&stream_id);
+                        }
+                        Err(tokio_quiche::quiche::Error::Done) => {
+                            self.pending_commands.push_front(QuicStreamCommand::Send {
+                                stream_id,
+                                data,
+                                fin,
+                            });
+                            break;
+                        }
+                        Err(tokio_quiche::quiche::Error::StreamStopped(error_code)) => {
+                            let _ = self.event_tx.send(QuicStreamEvent::Reset {
+                                stream_id,
+                                error_code,
+                            });
+                        }
+                        Err(error) => return Err(error.into()),
+                    },
+                    QuicStreamCommand::Shutdown {
+                        stream_id,
+                        direction,
+                        error_code,
+                    } => {
+                        let direction = match direction {
+                            QuicStreamDirection::Read => tokio_quiche::quiche::Shutdown::Read,
+                            QuicStreamDirection::Write => tokio_quiche::quiche::Shutdown::Write,
+                        };
+                        match qconn.stream_shutdown(stream_id, direction, error_code) {
+                            Ok(()) | Err(tokio_quiche::quiche::Error::Done) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                }
+            }
+
+            Ok(())
+        }
+    }
+
+    struct TokioQuicheSessionApp {
+        flow_key: pingora_core::protocols::l4::datagram::DatagramFlowKey,
+        local_addr: SocketAddr,
+        peer_addr: SocketAddr,
+        negotiated: Arc<Mutex<NegotiatedMetadata>>,
+        close_tx: mpsc::UnboundedSender<QuicDownstreamCloseEvent>,
+        handshake_tx: Option<oneshot::Sender<()>>,
+        runtime: StreamRuntime,
+    }
+
+    impl TokioQuicheSessionApp {
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            flow_key: pingora_core::protocols::l4::datagram::DatagramFlowKey,
+            local_addr: SocketAddr,
+            peer_addr: SocketAddr,
+            negotiated: Arc<Mutex<NegotiatedMetadata>>,
+            close_tx: mpsc::UnboundedSender<QuicDownstreamCloseEvent>,
+            handshake_tx: Option<oneshot::Sender<()>>,
+            cmd_rx: mpsc::UnboundedReceiver<QuicStreamCommand>,
+            event_tx: mpsc::UnboundedSender<QuicStreamEvent>,
+            max_datagram_size: usize,
+        ) -> Self {
+            Self {
+                flow_key,
+                local_addr,
+                peer_addr,
+                negotiated,
+                close_tx,
+                handshake_tx,
+                runtime: StreamRuntime::new(cmd_rx, event_tx, max_datagram_size),
+            }
+        }
+    }
+
+    impl tokio_quiche::ApplicationOverQuic for TokioQuicheSessionApp {
+        fn on_conn_established(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+            _handshake_info: &tokio_quiche::quic::HandshakeInfo,
+        ) -> tokio_quiche::QuicResult<()> {
+            let alpn =
+                (!qconn.application_proto().is_empty()).then(|| qconn.application_proto().to_vec());
+            let server_name = qconn.server_name().map(str::to_string);
+            *self.negotiated.lock() = NegotiatedMetadata {
+                alpn_protocol: alpn,
+                server_name,
+            };
+            if let Some(handshake_tx) = self.handshake_tx.take() {
+                let _ = handshake_tx.send(());
+            }
+            Ok(())
+        }
+
+        fn should_act(&self) -> bool {
+            true
+        }
+
+        fn buffer(&mut self) -> &mut [u8] {
+            &mut self.runtime.buffer
+        }
+
+        async fn wait_for_data(
+            &mut self,
+            _qconn: &mut tokio_quiche::quiche::Connection,
+        ) -> tokio_quiche::QuicResult<()> {
+            match self.runtime.cmd_rx.recv().await {
+                Some(command) => {
+                    self.runtime.queue_command(command);
+                    Ok(())
+                }
+                None => {
+                    pending::<()>().await;
+                    Ok(())
+                }
+            }
+        }
+
+        fn process_reads(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+        ) -> tokio_quiche::QuicResult<()> {
+            self.runtime.emit_read_events(qconn)
+        }
+
+        fn process_writes(
+            &mut self,
+            qconn: &mut tokio_quiche::quiche::Connection,
+        ) -> tokio_quiche::QuicResult<()> {
+            while let Ok(command) = self.runtime.cmd_rx.try_recv() {
+                self.runtime.queue_command(command);
+            }
+            self.runtime.drain_pending_commands(qconn)?;
+            self.runtime.enqueue_writable_events(qconn);
+            Ok(())
+        }
+
+        fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
+            &mut self,
+            _qconn: &mut tokio_quiche::quiche::Connection,
+            _metrics: &M,
+            connection_result: &tokio_quiche::QuicResult<()>,
+        ) {
+            let reason = match connection_result {
+                Ok(()) => "closed".to_string(),
+                Err(error) => error.to_string(),
+            };
+            let _ = self.close_tx.send(QuicDownstreamCloseEvent {
+                flow_key: self.flow_key.clone(),
+                local_addr: self.local_addr.clone(),
+                peer_addr: self.peer_addr.clone(),
+                backend: QuicBackend::TokioQuiche,
+                reason,
+            });
+        }
+    }
+
+    /// A downstream QUIC listener backed by `tokio-quiche`.
+    pub struct TokioQuicheDownstreamListener {
+        config: QuicListenerConfig,
+        local_addr: SocketAddr,
+        accept_stream: AsyncMutex<tokio_quiche::QuicConnectionStream<DefaultMetrics>>,
+        sessions: Mutex<
+            HashMap<pingora_core::protocols::l4::datagram::DatagramFlowKey, QuicDownstreamSession>,
+        >,
+        stats: QuicListenerStatsInner,
+        close_rx: AsyncMutex<mpsc::UnboundedReceiver<QuicDownstreamCloseEvent>>,
+        close_tx: mpsc::UnboundedSender<QuicDownstreamCloseEvent>,
+    }
+
+    impl TokioQuicheDownstreamListener {
+        fn new(
+            config: QuicListenerConfig,
+            local_addr: SocketAddr,
+            accept_stream: tokio_quiche::QuicConnectionStream<DefaultMetrics>,
+        ) -> Self {
+            let (close_tx, close_rx) = mpsc::unbounded_channel();
+            Self {
+                config,
+                local_addr,
+                accept_stream: AsyncMutex::new(accept_stream),
+                sessions: Mutex::new(HashMap::new()),
+                stats: QuicListenerStatsInner::default(),
+                close_rx: AsyncMutex::new(close_rx),
+                close_tx,
+            }
+        }
+
+        /// Borrow the configuration used for this listener.
+        pub fn config(&self) -> &QuicListenerConfig {
+            &self.config
+        }
+
+        /// Return the transport backend used by this listener.
+        pub fn backend(&self) -> QuicBackend {
+            QuicBackend::TokioQuiche
+        }
+
+        /// Return the bound local address for this listener.
+        pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.local_addr.clone())
+        }
+
+        /// Return a snapshot of listener lifecycle counters.
+        pub fn stats(&self) -> QuicListenerStats {
+            self.stats.snapshot()
+        }
+
+        /// Return the number of currently tracked downstream sessions.
+        pub fn tracked_sessions(&self) -> usize {
+            self.sessions.lock().len()
+        }
+
+        /// Accept and complete a downstream QUIC handshake.
+        pub async fn accept_session(&self) -> Result<QuicDownstreamSession> {
+            let mut accept_stream = self.accept_stream.lock().await;
+            let next = accept_stream.next().await;
+            drop(accept_stream);
+
+            let Some(initial_result) = next else {
+                return Error::e_explain(
+                    ErrorType::ConnectionClosed,
+                    "tokio-quiche listener closed before accepting a session",
+                );
+            };
+
+            let initial = match initial_result {
+                Ok(initial) => initial,
+                Err(error) => {
+                    self.stats
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    observe_quic_event("listener", &self.config.name, "handshake_failed");
+                    return Err(Error::because(
+                        ErrorType::ReadError,
+                        "accepting tokio-quiche initial",
+                        error,
+                    ));
+                }
+            };
+
+            let local_addr = SocketAddr::Inet(initial.local_addr());
+            let peer_addr = SocketAddr::Inet(initial.peer_addr());
+            let flow_key = DatagramMeta {
+                local_addr: local_addr.clone(),
+                peer_addr: peer_addr.clone(),
+            }
+            .flow_key(self.config.name.clone());
+            let negotiated = Arc::new(Mutex::new(NegotiatedMetadata::default()));
+            let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+            let (event_tx, event_rx) = mpsc::unbounded_channel();
+            let (handshake_tx, handshake_rx) = oneshot::channel();
+            let stream_handle =
+                QuicStreamHandle::new(Arc::new(QuicStreamController::new(cmd_tx, event_rx)));
+            let app = TokioQuicheSessionApp::new(
+                flow_key.clone(),
+                local_addr.clone(),
+                peer_addr.clone(),
+                Arc::clone(&negotiated),
+                self.close_tx.clone(),
+                Some(handshake_tx),
+                cmd_rx,
+                event_tx,
+                self.config.max_datagram_size,
+            );
+
+            let handshake_started = Instant::now();
+            let (connection, worker) = match initial.handshake(app).await {
+                Ok(result) => result,
+                Err(error) => {
+                    self.stats
+                        .handshake_failures
+                        .fetch_add(1, Ordering::Relaxed);
+                    observe_quic_event("listener", &self.config.name, "handshake_failed");
+                    return Err(Error::because(
+                        ErrorType::TLSHandshakeFailure,
+                        "completing tokio-quiche downstream handshake",
+                        error,
+                    ));
+                }
+            };
+
+            tokio_quiche::InitialQuicConnection::resume(worker);
+            let _ = handshake_rx.await;
+
+            let negotiated = negotiated.lock().clone();
+            let now = Instant::now();
+            let session = QuicDownstreamSession {
+                flow_key: flow_key.clone(),
+                meta: QuicConnectionMeta {
+                    local_addr,
+                    peer_addr,
+                    alpn_protocol: negotiated.alpn_protocol,
+                    server_name: negotiated.server_name,
+                    resumed: false,
+                },
+                established_at: handshake_started,
+                last_seen: now,
+                packets_received: 0,
+                stream_handle: Some(stream_handle),
+            };
+
+            self.sessions.lock().insert(flow_key, session.clone());
+            self.stats.accepted_sessions.fetch_add(1, Ordering::Relaxed);
+            observe_quic_event("listener", &self.config.name, "session_accepted");
+            log::info!(
+                "accepted tokio-quiche downstream session {} from {} to {}",
+                self.config.name,
+                connection.peer_addr(),
+                connection.local_addr()
+            );
+            Ok(session)
+        }
+
+        /// Wait for the next close event emitted by the QUIC backend.
+        pub async fn recv_close_event(&self) -> Option<QuicDownstreamCloseEvent> {
+            let mut close_rx = self.close_rx.lock().await;
+            let event = close_rx.recv().await?;
+            drop(close_rx);
+
+            if self.sessions.lock().remove(&event.flow_key).is_some() {
+                self.stats.closed_sessions.fetch_add(1, Ordering::Relaxed);
+                observe_quic_event("listener", &self.config.name, "session_closed");
+            }
+
+            Some(event)
+        }
+    }
+
+    /// Feature-gated QUIC transport adapter backed by `tokio-quiche`.
+    #[derive(Debug, Default, Clone, Copy)]
+    pub struct TokioQuicheTransport;
+
+    impl TokioQuicheTransport {
+        /// Create a new adapter backed by `tokio-quiche`.
+        pub fn new() -> Self {
+            Self
         }
 
         /// Return the backend label for observability and debugging.
         pub fn backend_name(&self) -> &'static str {
-            let _ = &self.params;
             "tokio-quiche"
+        }
+
+        fn build_listener_params<'a>(
+            &self,
+            config: &'a QuicListenerConfig,
+        ) -> Result<ConnectionParams<'a>> {
+            config.validate()?;
+            validate_tokio_quiche_tls(config.tls_certificate.as_ref(), "QUIC listener")?;
+            let tls = config
+                .tls_certificate
+                .as_ref()
+                .expect("validated tokio-quiche listener TLS");
+            let mut settings = QuicSettings::default();
+            settings.alpn = config.alpn_protocols.clone();
+            settings.max_idle_timeout = Some(config.max_idle_timeout);
+            settings.initial_max_streams_bidi = config.max_concurrent_bidi_streams;
+            settings.max_recv_udp_payload_size = config.max_datagram_size;
+            settings.max_send_udp_payload_size = config.max_datagram_size;
+            settings.disable_client_ip_validation = true;
+            Ok(ConnectionParams::new_server(
+                settings,
+                tls_certificate_paths(tls),
+                Hooks::default(),
+            ))
+        }
+
+        fn build_connector_params<'a>(
+            &self,
+            config: &'a QuicConnectorConfig,
+        ) -> Result<ConnectionParams<'a>> {
+            config.validate()?;
+            let mut settings = QuicSettings::default();
+            settings.alpn = config.alpn_protocols.clone();
+            settings.max_idle_timeout = Some(config.idle_timeout);
+            settings.verify_peer = config.verify_peer;
+            let tls = config
+                .client_certificate
+                .as_ref()
+                .map(tls_certificate_paths);
+            Ok(ConnectionParams::new_client(
+                settings,
+                tls,
+                Hooks::default(),
+            ))
         }
     }
 
-    impl Default for TokioQuicheTransport {
-        fn default() -> Self {
-            Self::new()
-        }
+    pub(crate) async fn establish_upstream(
+        config: &QuicConnectorConfig,
+        stats: &super::QuicConnectorStatsInner,
+    ) -> Result<QuicUpstreamSession> {
+        let transport = TokioQuicheTransport::new();
+        let params = transport.build_connector_params(config)?;
+        let bind_addr = config
+            .local_bind_addr
+            .clone()
+            .unwrap_or_else(|| default_local_addr_for(&config.peer_addr));
+        let local_addr = *bind_addr
+            .as_inet()
+            .expect("validated inet socket address for tokio-quiche bind");
+        let peer_addr = *config
+            .peer_addr
+            .as_inet()
+            .expect("validated inet socket address for tokio-quiche peer");
+        let socket = UdpSocket::bind(local_addr).await.map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "binding tokio-quiche upstream UDP socket",
+                error,
+            )
+        })?;
+        socket.connect(peer_addr).await.map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "connecting tokio-quiche upstream UDP socket",
+                error,
+            )
+        })?;
+        let socket = ConnectedSocket::try_from(socket).map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "wrapping tokio-quiche upstream socket",
+                error,
+            )
+        })?;
+
+        let negotiated = Arc::new(Mutex::new(NegotiatedMetadata::default()));
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
+        let (close_tx, _close_rx) = mpsc::unbounded_channel();
+        let (handshake_tx, handshake_rx) = oneshot::channel();
+        let stream_handle =
+            QuicStreamHandle::new(Arc::new(QuicStreamController::new(cmd_tx, event_rx)));
+        let app = TokioQuicheSessionApp::new(
+            DatagramMeta {
+                local_addr: bind_addr.clone(),
+                peer_addr: config.peer_addr.clone(),
+            }
+            .flow_key(config.name.clone()),
+            bind_addr.clone(),
+            config.peer_addr.clone(),
+            Arc::clone(&negotiated),
+            close_tx,
+            Some(handshake_tx),
+            cmd_rx,
+            event_tx,
+            1350,
+        );
+
+        stats.handshake_attempts.fetch_add(1, Ordering::Relaxed);
+        observe_quic_event("connector", &config.name, "handshake_started");
+        let connection = timeout(
+            config.connect_timeout,
+            connect_with_config(socket, config.server_name.as_deref(), &params, app),
+        )
+        .await
+        .map_err(|_| {
+            stats.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
+            observe_quic_event("connector", &config.name, "handshake_timeout");
+            Error::explain(
+                ErrorType::ConnectTimedout,
+                "tokio-quiche upstream handshake timed out before session establishment",
+            )
+        })?
+        .map_err(|error| {
+            stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
+            observe_quic_event("connector", &config.name, "handshake_failed");
+            Error::because(
+                ErrorType::TLSHandshakeFailure,
+                "establishing tokio-quiche upstream session",
+                error,
+            )
+        })?;
+
+        let _ = handshake_rx.await;
+        let negotiated = negotiated.lock().clone();
+        let established_at = Instant::now();
+        stats.established_sessions.fetch_add(1, Ordering::Relaxed);
+        observe_quic_event("connector", &config.name, "handshake_established");
+
+        Ok(QuicUpstreamSession {
+            destination: super::QuicUpstreamDestination::from(config),
+            meta: QuicConnectionMeta {
+                local_addr: SocketAddr::Inet(connection.local_addr()),
+                peer_addr: SocketAddr::Inet(connection.peer_addr()),
+                alpn_protocol: negotiated.alpn_protocol,
+                server_name: negotiated.server_name.or_else(|| config.server_name.clone()),
+                resumed: false,
+            },
+            established_at,
+            connect_timeout: config.connect_timeout,
+            idle_timeout: config.idle_timeout,
+            last_used_at: established_at,
+            reuse_count: 0,
+            stream_handle: Some(stream_handle),
+        })
     }
 
     #[async_trait]
     impl QuicTransport for TokioQuicheTransport {
-        type Listener = QuicDownstreamListener;
+        type Listener = TokioQuicheDownstreamListener;
         type Connector = QuicConnectorHandle;
 
         async fn bind_listener(&self, config: QuicListenerConfig) -> Result<Self::Listener> {
-            let _ = &self.params;
-            QuicDownstreamListener::bind(config).await
+            let params = self.build_listener_params(&config)?;
+            let socket = UdpSocket::bind(config.listen_addr.to_string())
+                .await
+                .map_err(|error| {
+                    Error::because(
+                        ErrorType::BindError,
+                        "binding tokio-quiche downstream UDP listener",
+                        error,
+                    )
+                })?;
+            let local_addr = SocketAddr::Inet(socket.local_addr().map_err(|error| {
+                Error::because(
+                    ErrorType::BindError,
+                    "reading tokio-quiche listener local address",
+                    error,
+                )
+            })?);
+            let mut listeners =
+                tokio_quiche::listen([socket], params, DefaultMetrics).map_err(|error| {
+                    Error::because(
+                        ErrorType::BindError,
+                        "starting tokio-quiche listener",
+                        error,
+                    )
+                })?;
+            let accept_stream = listeners.remove(0);
+            Ok(TokioQuicheDownstreamListener::new(
+                config,
+                local_addr,
+                accept_stream,
+            ))
         }
 
         async fn connect(&self, config: QuicConnectorConfig) -> Result<Self::Connector> {
-            let _ = &self.params;
-            QuicConnectorHandle::new(config)
+            let _ = self.build_connector_params(&config)?;
+            QuicConnectorHandle::new_with_backend(config, QuicBackend::TokioQuiche)
         }
     }
+
+    fn tls_certificate_paths(tls: &QuicTlsCertificate) -> TlsCertificatePaths<'_> {
+        TlsCertificatePaths {
+            cert: &tls.cert_path,
+            private_key: &tls.private_key_path,
+            kind: match tls.kind {
+                QuicCertificateKind::X509 => CertificateKind::X509,
+                QuicCertificateKind::RawPublicKey => CertificateKind::RawPublicKey,
+            },
+        }
+    }
+
+    fn validate_tokio_quiche_tls(tls: Option<&QuicTlsCertificate>, role: &str) -> Result<()> {
+        let Some(tls) = tls else {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                format!("{role} requires TLS credentials for tokio-quiche"),
+            );
+        };
+
+        if tls.cert_path.is_empty() || tls.private_key_path.is_empty() {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                format!("{role} requires non-empty TLS certificate paths"),
+            );
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(feature = "tokio-quiche")]
+async fn establish_tokio_quiche_upstream(
+    config: &QuicConnectorConfig,
+    stats: &QuicConnectorStatsInner,
+) -> Result<QuicUpstreamSession> {
+    tokio_quiche_adapter::establish_upstream(config, stats).await
 }
 
 fn validate_inet_addr(addr: &SocketAddr, role: &str) -> Result<()> {
@@ -918,18 +1917,31 @@ fn upstream_pool_key(destination: &QuicUpstreamDestination) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        NoopQuicTransport, QuicConnectionMeta, QuicConnectorConfig, QuicDownstreamListener,
-        QuicListenerConfig, QuicSessionEvent, QuicTransport,
+        NoopQuicTransport, QuicBackend, QuicConnectionMeta, QuicConnectorConfig,
+        QuicDownstreamListener, QuicListenerConfig, QuicSessionEvent, QuicTransport,
     };
+    #[cfg(feature = "tokio-quiche")]
+    use super::{QuicCertificateKind, QuicTlsCertificate};
     use pingora_core::protocols::l4::datagram::{Datagram, DatagramMeta, UdpListener};
     use pingora_core::protocols::l4::socket::SocketAddr;
     use pingora_error::ErrorType;
+    #[cfg(feature = "tokio-quiche")]
+    use std::sync::Arc;
     use std::time::Duration;
 
     fn downstream_listener_config(listen_addr: SocketAddr) -> QuicListenerConfig {
         let mut config = QuicListenerConfig::new("h3-listener", listen_addr);
         config.alpn_protocols.push(b"h3".to_vec());
         config
+    }
+
+    #[cfg(feature = "tokio-quiche")]
+    fn downstream_listener_tls() -> QuicTlsCertificate {
+        QuicTlsCertificate::new(
+            "pingora-core/tests/certs/server.crt",
+            "pingora-core/tests/certs/server.key",
+            QuicCertificateKind::X509,
+        )
     }
 
     #[test]
@@ -1098,6 +2110,7 @@ mod tests {
 
         let connector = super::QuicConnectorHandle {
             config,
+            backend: QuicBackend::Noop,
             stats: super::QuicConnectorStatsInner::default(),
         };
         let runtime = tokio::runtime::Runtime::new().unwrap();
@@ -1228,9 +2241,250 @@ mod tests {
 
         let transport = TokioQuicheTransport::new();
         assert_eq!(transport.backend_name(), "tokio-quiche");
-        let listener = downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()));
+        let listener = downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
+            .with_tls_certificate(Some(downstream_listener_tls()));
 
         let handle = transport.bind_listener(listener).await.unwrap();
         assert_eq!(handle.config().name.as_ref(), "h3-listener");
+        assert_eq!(handle.backend(), QuicBackend::TokioQuiche);
+    }
+
+    #[cfg(feature = "tokio-quiche")]
+    #[tokio::test]
+    async fn tokio_quiche_transport_marks_connector_backend() {
+        use super::tokio_quiche_adapter::TokioQuicheTransport;
+
+        let transport = TokioQuicheTransport::new();
+        let connector = QuicConnectorConfig::new(
+            "origin-h3",
+            SocketAddr::Inet("127.0.0.1:8443".parse().unwrap()),
+        )
+        .with_alpn_protocols(vec![b"h3".to_vec()]);
+
+        let handle = transport.connect(connector).await.unwrap();
+        assert_eq!(handle.backend(), QuicBackend::TokioQuiche);
+    }
+
+    #[cfg(feature = "tokio-quiche")]
+    #[tokio::test]
+    async fn tokio_quiche_listener_accepts_real_handshake() {
+        use super::tokio_quiche_adapter::TokioQuicheTransport;
+        use std::future::pending;
+        use tokio::time::{timeout, Duration as TokioDuration};
+        use tokio_quiche::quic::connect_with_config;
+        use tokio_quiche::settings::{ConnectionParams, Hooks, QuicSettings};
+        use tokio_quiche::socket::Socket;
+
+        struct TestClientApp {
+            buffer: Vec<u8>,
+        }
+
+        impl Default for TestClientApp {
+            fn default() -> Self {
+                Self {
+                    buffer: vec![0; 1350],
+                }
+            }
+        }
+
+        impl tokio_quiche::ApplicationOverQuic for TestClientApp {
+            fn on_conn_established(
+                &mut self,
+                _qconn: &mut tokio_quiche::quiche::Connection,
+                _handshake_info: &tokio_quiche::quic::HandshakeInfo,
+            ) -> tokio_quiche::QuicResult<()> {
+                Ok(())
+            }
+
+            fn should_act(&self) -> bool {
+                false
+            }
+
+            fn buffer(&mut self) -> &mut [u8] {
+                &mut self.buffer
+            }
+
+            async fn wait_for_data(
+                &mut self,
+                _qconn: &mut tokio_quiche::quiche::Connection,
+            ) -> tokio_quiche::QuicResult<()> {
+                pending::<()>().await;
+                Ok(())
+            }
+
+            fn process_reads(
+                &mut self,
+                _qconn: &mut tokio_quiche::quiche::Connection,
+            ) -> tokio_quiche::QuicResult<()> {
+                Ok(())
+            }
+
+            fn process_writes(
+                &mut self,
+                _qconn: &mut tokio_quiche::quiche::Connection,
+            ) -> tokio_quiche::QuicResult<()> {
+                Ok(())
+            }
+        }
+
+        let transport = TokioQuicheTransport::new();
+        let config = downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
+            .with_tls_certificate(Some(downstream_listener_tls()));
+        let listener = transport.bind_listener(config).await.unwrap();
+        let server_addr = *listener.local_addr().unwrap().as_inet().unwrap();
+
+        let client_task = tokio::spawn(async move {
+            let client_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            client_socket.connect(server_addr).await.unwrap();
+            let socket = Socket::try_from(client_socket).unwrap();
+            let mut settings = QuicSettings::default();
+            settings.alpn = vec![b"h3".to_vec()];
+            settings.verify_peer = false;
+            settings.max_idle_timeout = Some(Duration::from_secs(30));
+            let params = ConnectionParams::new_client(settings, None, Hooks::default());
+            connect_with_config(socket, Some("localhost"), &params, TestClientApp::default())
+                .await
+                .unwrap()
+        });
+
+        let session = timeout(TokioDuration::from_secs(2), listener.accept_session())
+            .await
+            .unwrap()
+            .unwrap();
+        let _client_conn = client_task.await.unwrap();
+
+        assert_eq!(session.meta.alpn_protocol.as_deref(), Some(&b"h3"[..]));
+        assert_eq!(listener.tracked_sessions(), 1);
+        let stats = listener.stats();
+        assert_eq!(stats.accepted_sessions, 1);
+        assert_eq!(stats.handshake_failures, 0);
+    }
+
+    #[cfg(feature = "tokio-quiche")]
+    #[tokio::test]
+    async fn tokio_quiche_upstream_session_exchanges_stream_events() {
+        use super::tokio_quiche_adapter::TokioQuicheTransport;
+        use tokio::time::{timeout, Duration as TokioDuration};
+
+        async fn recv_until_data(
+            session: &super::QuicDownstreamSession,
+        ) -> (u64, Vec<u8>, bool) {
+            loop {
+                let event = timeout(TokioDuration::from_secs(2), session.recv_stream_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let super::QuicStreamEvent::Data {
+                    stream_id,
+                    data,
+                    fin,
+                } = event
+                {
+                    return (stream_id, data, fin);
+                }
+            }
+        }
+
+        async fn recv_upstream_until_data(
+            session: &super::QuicUpstreamSession,
+        ) -> (u64, Vec<u8>, bool) {
+            loop {
+                let event = timeout(TokioDuration::from_secs(2), session.recv_stream_event())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if let super::QuicStreamEvent::Data {
+                    stream_id,
+                    data,
+                    fin,
+                } = event
+                {
+                    return (stream_id, data, fin);
+                }
+            }
+        }
+
+        let transport = TokioQuicheTransport::new();
+        let listener = Arc::new(
+            transport
+                .bind_listener(
+                    downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
+                        .with_tls_certificate(Some(downstream_listener_tls())),
+                )
+                .await
+                .unwrap(),
+        );
+        let server_addr = listener.local_addr().unwrap();
+        let listener_task = {
+            let listener = Arc::clone(&listener);
+            tokio::spawn(async move {
+                let session = listener.accept_session().await.unwrap();
+                let (stream_id, data, fin) = recv_until_data(&session).await;
+                assert_eq!(stream_id, 0);
+                assert_eq!(data, b"ping".to_vec());
+                assert!(fin);
+                session
+                    .send_stream_data(stream_id, b"pong".to_vec(), true)
+                    .unwrap();
+                session
+            })
+        };
+
+        let connector = transport
+            .connect(
+                QuicConnectorConfig::new("origin-h3", server_addr)
+                    .with_alpn_protocols(vec![b"h3".to_vec()])
+                    .with_server_name(Some("localhost".to_string())),
+            )
+            .await
+            .unwrap();
+        let upstream = connector.establish().await.unwrap();
+        upstream.send_stream_data(0, b"ping".to_vec(), true).unwrap();
+        let (stream_id, data, fin) = recv_upstream_until_data(&upstream).await;
+
+        assert_eq!(stream_id, 0);
+        assert_eq!(data, b"pong".to_vec());
+        assert!(fin);
+        let server_session = listener_task.await.unwrap();
+        assert!(server_session.stream_handle.is_some());
+        assert!(upstream.stream_handle.is_some());
+    }
+
+    #[cfg(feature = "tokio-quiche")]
+    #[tokio::test]
+    async fn tokio_quiche_upstream_pool_reuses_real_sessions() {
+        use super::tokio_quiche_adapter::TokioQuicheTransport;
+
+        let transport = TokioQuicheTransport::new();
+        let listener = transport
+            .bind_listener(
+                downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
+                    .with_tls_certificate(Some(downstream_listener_tls())),
+            )
+            .await
+            .unwrap();
+        let connector = transport
+            .connect(
+                QuicConnectorConfig::new("origin-h3", listener.local_addr().unwrap())
+                    .with_alpn_protocols(vec![b"h3".to_vec()])
+                    .with_server_name(Some("localhost".to_string())),
+            )
+            .await
+            .unwrap();
+        let pool = super::QuicUpstreamPool::new();
+
+        let accept_task = tokio::spawn(async move {
+            let _ = listener.accept_session().await.unwrap();
+        });
+
+        let (session, reused) = pool.checkout(&connector).await.unwrap();
+        assert!(!reused);
+        pool.release(session);
+
+        let (session, reused) = pool.checkout(&connector).await.unwrap();
+        assert!(reused);
+        assert!(session.meta.resumed);
+        assert!(session.stream_handle.is_some());
+        accept_task.await.unwrap();
     }
 }
