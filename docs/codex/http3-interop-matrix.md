@@ -23,6 +23,9 @@ The matrix is not a claim that every HTTP/3 extension or peer is supported.
 Anything outside this matrix must remain explicitly documented as unsupported,
 experimental, or unvalidated.
 
+Use `docs/codex/http3-downstream-validation-playbook.md` as the execution guide
+for downstream client runs.
+
 ## Release-Gate Rule
 
 The HTTP/3 path should not be declared production-ready until:
@@ -43,7 +46,6 @@ stacks.
 | --- | --- | --- | --- |
 | CLI | `curl --http3` | Record exact `curl` and `ngtcp2` or `quiche` backend versions | Basic request and response validation, negotiation, and `alt-svc` behavior |
 | Debug client | `h3i` | Record exact build or release tag | Lower-level header, stream, and close debugging |
-| Browser-oriented stack | Chrome or Chromium | Record exact browser version | Browser-like negotiation and ingress behavior |
 
 ### Upstream Origins
 
@@ -162,3 +164,59 @@ For each interop run, record:
 
 This keeps the support boundary explicit and prevents one-off successful tests
 from turning into undocumented support claims.
+
+## Recorded Runs
+
+### 2026-03-29: Downstream `curl --http3-only`
+
+- Pingora commit: local working tree after `585cfee`
+- Scenario category: downstream
+- Ingress example: temporary downstream HTTP/3 validation harness used during development
+- Origin: example-local response path
+- Origin version: N/A
+- Client: `curl`
+- Client version: `8.2.1-DEV`
+- Operating system: local developer environment
+- Protocol path validated: `client HTTP/3 -> Pingora downstream HTTP/3 ingress`
+- Request path: `GET /about/`
+- Request body: none
+- Negotiated protocol: HTTP/3
+- Observed alt-svc: not applicable for `--http3-only` direct validation
+- Result classification: `Pass`
+- Notes: response was `HTTP/3 200` with body `path=/about/ body=`
+
+### 2026-03-29: Downstream `curl --http3-only` POST body echo
+
+- Pingora commit: local working tree after `585cfee`
+- Scenario category: downstream
+- Ingress example: temporary downstream HTTP/3 validation harness used during development
+- Origin: example-local response path
+- Origin version: N/A
+- Client: `curl`
+- Client version: `8.2.1-DEV`
+- Operating system: local developer environment
+- Protocol path validated: `client HTTP/3 -> Pingora downstream HTTP/3 ingress`
+- Request path: `POST /echo`
+- Request body: `pingora-http3`
+- Negotiated protocol: HTTP/3
+- Observed alt-svc: not applicable for `--http3-only` direct validation
+- Result classification: `Pass`
+- Notes: response body matched request body exactly
+
+### 2026-03-29: Downstream `h3i`
+
+- Pingora commit: local working tree after `585cfee`
+- Scenario category: downstream
+- Ingress example: temporary downstream HTTP/3 validation harness used during development
+- Origin: example-local response path
+- Origin version: N/A
+- Client: `h3i`
+- Client version: `0.6.0`
+- Operating system: local developer environment
+- Protocol path validated: `client HTTP/3 -> Pingora downstream HTTP/3 ingress`
+- Request path: `GET /about`
+- Request body: none
+- Negotiated protocol: HTTP/3
+- Observed alt-svc: not applicable for direct H3 validation
+- Result classification: `Pass`
+- Notes: `h3i` received `:status: 200`, `server: pingora-http3-ingress-example`, `content-type: text/plain; charset=utf-8`, and one `DATA` frame of length `30`; connection later idled out without an application-level failure

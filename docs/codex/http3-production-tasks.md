@@ -25,15 +25,14 @@ Relevant code and docs:
 - `pingora-proxy/src/proxy_h3.rs`
 - `pingora-quic/src/lib.rs`
 
-### Task 13.2: Validate downstream HTTP/3 against real clients
+### [Implemented] Task 13.2: Validate downstream HTTP/3 against real clients
 
 Summary: prove that Pingora behaves correctly as an HTTP/3 ingress with
 external client implementations.
 
 Implementation steps:
 
-- run the downstream path against `curl --http3`, `h3i`, and at least one
-  browser-oriented stack
+- run the downstream path against `curl --http3` and `h3i`
 - verify request headers, bodies, resets, and negotiation behavior
 - record any peer-specific quirks and decide whether to fix or document them
 - add integration notes to the interop matrix

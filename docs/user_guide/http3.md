@@ -151,7 +151,7 @@ pooled reuse.
 ## Example
 
 See [http3_proxy.rs](/home/alekitto/projects/pingora/pingora-proxy/examples/http3_proxy.rs)
-for a minimal example that combines:
+for a proxy-oriented example that combines:
 
 - downstream `alt-svc` advertisement
 - explicit `HttpUpstreamTransport::Http3` selection
