@@ -57,6 +57,14 @@ fn main() {
         }
         let reuse_elapsed = start.elapsed();
 
+        let mut expired = connector.establish().await.unwrap();
+        expired.last_used_at = Instant::now() - expired.idle_timeout - Duration::from_secs(1);
+        pool.release(expired);
+
+        let start = Instant::now();
+        let expired = black_box(pool.prune_expired());
+        let prune_elapsed = start.elapsed();
+
         println!(
             "quic_upstream_pool establish: {:?} total, {:?} avg",
             establish_elapsed,
@@ -66,6 +74,10 @@ fn main() {
             "quic_upstream_pool reuse: {:?} total, {:?} avg",
             reuse_elapsed,
             reuse_elapsed / ITERATIONS as u32
+        );
+        println!(
+            "quic_upstream_pool prune_expired: {:?} total, removed {} sessions",
+            prune_elapsed, expired
         );
     });
 }

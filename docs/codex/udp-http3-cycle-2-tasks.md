@@ -405,7 +405,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 12
 
-### Task 12.1
+### [Implemented] Task 12.1
 
 Concise, user-visible summary of the fix
 
@@ -422,9 +422,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Validation note: `docs/codex/udp-http3-validation.md`
-- HTTP/3 guide: `docs/user_guide/http3.md`
+- Interop matrix and HTTP/3 guide: `docs/codex/http3-interop-matrix.md` and `docs/user_guide/http3.md`
 
-### Task 12.2
+### [Implemented] Task 12.2
 
 Concise, user-visible summary of the fix
 
@@ -440,10 +440,10 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Existing Cycle 1 benchmarks: `pingora-core/benches`, `pingora-quic/benches`, and `pingora-proxy/benches`
+- Refined benchmarks: `pingora-quic/benches/upstream_pool.rs` and `pingora-proxy/benches/http3_bridge.rs`
 - Validation note: `docs/codex/udp-http3-validation.md`
 
-### Task 12.3
+### [Implemented] Task 12.3
 
 Concise, user-visible summary of the fix
 
@@ -460,10 +460,10 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Prometheus docs: `docs/user_guide/prom.md`
-- UDP guide: `docs/user_guide/udp.md`
 - HTTP/3 guide: `docs/user_guide/http3.md`
+- Validation notes: `docs/codex/udp-http3-validation.md`
 
-### Task 12.4
+### [Implemented] Task 12.4
 
 Concise, user-visible summary of the fix
 
@@ -480,7 +480,7 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Cycle 2 roadmap: `docs/codex/udp-http3-cycle-2-roadmap.md`
-- Current docs and examples under `docs` and the workspace example directories
+- Stabilized support boundary docs: `docs/user_guide/http3.md`
 
 ## Suggested delivery order
 

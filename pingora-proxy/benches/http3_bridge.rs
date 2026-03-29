@@ -14,8 +14,9 @@
 
 use pingora_core::protocols::l4::datagram::{Datagram, DatagramFlowKey, DatagramMeta};
 use pingora_core::protocols::l4::socket::SocketAddr;
+use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport};
 use pingora_http::Method;
-use pingora_proxy::{Http3AcceptedStream, Http3ProxyBridge};
+use pingora_proxy::{Http3AcceptedStream, Http3ProxyBridge, Http3UpstreamExecutor};
 use pingora_quic::{
     QuicConnectionMeta, QuicDownstreamSession, QuicIncomingDatagram, QuicSessionEvent,
 };
@@ -72,6 +73,7 @@ fn accepted_stream(event: QuicSessionEvent, flow_id: usize, stream_id: u64) -> H
 
 fn main() {
     let bridge = Http3ProxyBridge::new();
+    let executor = Http3UpstreamExecutor::new();
 
     let start = Instant::now();
     for index in 0..ITERATIONS {
@@ -101,6 +103,35 @@ fn main() {
     }
     let reused_elapsed = start.elapsed();
 
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        let peer = Http3Peer::new(("127.0.0.1", 8443), "example.com".to_string());
+        let config = executor.connector_config(&peer);
+        black_box(config.alpn_protocols.clone());
+        black_box(config.server_name.clone());
+    }
+    let connector_elapsed = start.elapsed();
+
+    let start = Instant::now();
+    for _ in 0..ITERATIONS {
+        let selected = executor
+            .select_upstream(
+                HttpUpstreamTransport::Http3,
+                Box::new(HttpPeer::new(
+                    ("127.0.0.1", 8080),
+                    false,
+                    "example.com".to_string(),
+                )),
+                Some(Box::new(Http3Peer::new(
+                    ("127.0.0.1", 8443),
+                    "example.com".to_string(),
+                ))),
+            )
+            .unwrap();
+        black_box(selected.transport());
+    }
+    let selection_elapsed = start.elapsed();
+
     println!(
         "http3_bridge accepted-streams: {:?} total, {:?} avg",
         accepted_elapsed,
@@ -110,5 +141,15 @@ fn main() {
         "http3_bridge reused-session: {:?} total, {:?} avg",
         reused_elapsed,
         reused_elapsed / ITERATIONS as u32
+    );
+    println!(
+        "http3_bridge upstream-connector-config: {:?} total, {:?} avg",
+        connector_elapsed,
+        connector_elapsed / ITERATIONS as u32
+    );
+    println!(
+        "http3_bridge upstream-selection: {:?} total, {:?} avg",
+        selection_elapsed,
+        selection_elapsed / ITERATIONS as u32
     );
 }

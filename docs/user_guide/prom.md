@@ -115,4 +115,14 @@ the same way as the UDP example above.
 - `handshake_established`
 - `handshake_timeout`
 
+For the pooled upstream HTTP/3 path, the most relevant `h3_pool` events are:
+
+- `session_establish_started`
+- `session_established`
+- `session_establish_timeout`
+- `session_establish_failed`
+- `session_reused`
+- `session_released`
+- `session_expired`
+
 See [HTTP/3 and QUIC](http3.md) for the current transport boundary and limitations.
