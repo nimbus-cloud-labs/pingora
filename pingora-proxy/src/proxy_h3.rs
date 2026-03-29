@@ -14,15 +14,26 @@
 
 //! Downstream HTTP/3 bridging on top of the QUIC transport layer.
 
+use futures::SinkExt;
 use http::header::{self, CONNECTION, HOST, UPGRADE};
 use http::Version;
 use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport, Peer};
 use pingora_error::{Error, ErrorType, Result};
-use pingora_http::{Method, RequestHeader};
-use pingora_quic::{QuicIncomingDatagram, QuicSessionEvent};
+use pingora_http::{Method, RequestHeader, ResponseHeader};
+use pingora_quic::{
+    Http3UpstreamPool, Http3UpstreamSession, QuicConnectorConfig, QuicDownstreamSession,
+    QuicIncomingDatagram, QuicSessionEvent, QuicUpstreamPoolStats,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use tokio::sync::oneshot;
+use tokio_quiche::buf_factory::BufFactory;
+use tokio_quiche::http3::driver::{
+    ClientH3Event, H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, NewClientRequest,
+    OutboundFrame, OutboundFrameSender,
+};
+use tokio_quiche::quiche::h3::{Header as H3Header, NameValue};
 
 /// Compatibility status for a proxy phase when used with downstream HTTP/3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -356,6 +367,391 @@ pub struct Http3DownstreamRequest {
     pub stream_id: u64,
     /// Request headers represented using Pingora's existing request type.
     pub request_header: RequestHeader,
+    /// Request body reader for the real downstream HTTP/3 stream, when available.
+    pub body_reader: Option<Http3BodyReader>,
+    /// Response writer for the same downstream HTTP/3 stream, when available.
+    pub response_writer: Option<Http3ResponseWriter>,
+    /// Whether downstream request trailers are surfaced by the current backend.
+    pub request_trailers_supported: bool,
+}
+
+/// Body data observed on a downstream HTTP/3 request stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http3BodyChunk {
+    /// Bytes received for this chunk.
+    pub data: Vec<u8>,
+    /// Whether this chunk closed the receive side of the stream.
+    pub fin: bool,
+}
+
+/// Read-side handle for a downstream HTTP/3 request body.
+#[derive(Debug)]
+pub struct Http3BodyReader {
+    recv: InboundFrameStream,
+}
+
+impl Http3BodyReader {
+    fn new(recv: InboundFrameStream) -> Self {
+        Self { recv }
+    }
+
+    /// Read the next request body chunk.
+    ///
+    /// Request trailers are not surfaced by the current tokio-quiche server
+    /// driver API, so `None` means the body stream has ended.
+    pub async fn recv_chunk(&mut self) -> Result<Option<Http3BodyChunk>> {
+        let Some(frame) = self.recv.recv().await else {
+            return Ok(None);
+        };
+
+        match frame {
+            InboundFrame::Body(buf, fin) => Ok(Some(Http3BodyChunk {
+                data: buf.into_inner().into_vec(),
+                fin,
+            })),
+            InboundFrame::Datagram(_) => Error::e_explain(
+                ErrorType::InternalError,
+                "HTTP/3 request body path does not accept DATAGRAM frames",
+            ),
+        }
+    }
+}
+
+/// Write-side handle for a downstream HTTP/3 response stream.
+#[derive(Debug)]
+pub struct Http3ResponseWriter {
+    send: OutboundFrameSender,
+    headers_sent: bool,
+}
+
+impl Http3ResponseWriter {
+    fn new(send: OutboundFrameSender) -> Self {
+        Self {
+            send,
+            headers_sent: false,
+        }
+    }
+
+    /// Write HTTP/3 response headers to the downstream stream.
+    pub async fn send_response_header(&mut self, response: &ResponseHeader) -> Result<()> {
+        if self.headers_sent {
+            return Error::e_explain(
+                ErrorType::InternalError,
+                "HTTP/3 response headers were already sent on this stream",
+            );
+        }
+
+        self.send
+            .send(OutboundFrame::Headers(
+                response_to_h3_headers(response),
+                None,
+            ))
+            .await
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 stream closed before response headers could be sent",
+                )
+            })?;
+        self.headers_sent = true;
+        Ok(())
+    }
+
+    /// Write response body bytes to the downstream stream.
+    pub async fn send_body(&mut self, body: &[u8], fin: bool) -> Result<()> {
+        self.send
+            .send(OutboundFrame::body(BufFactory::buf_from_slice(body), fin))
+            .await
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 stream closed before response body could be sent",
+                )
+            })
+    }
+
+    /// Write response trailers to the downstream stream.
+    pub async fn send_trailers(
+        &mut self,
+        trailers: &[(impl AsRef<str>, impl AsRef<str>)],
+    ) -> Result<()> {
+        let trailers = trailers
+            .iter()
+            .map(|(name, value)| H3Header::new(name.as_ref().as_bytes(), value.as_ref().as_bytes()))
+            .collect();
+        self.send
+            .send(OutboundFrame::Trailers(trailers, None))
+            .await
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 stream closed before response trailers could be sent",
+                )
+            })
+    }
+}
+
+/// Buffered body chunk to send to an upstream HTTP/3 origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Http3UpstreamBodyChunk {
+    /// Request body bytes for this chunk.
+    pub data: Vec<u8>,
+    /// Whether this chunk finishes the request body stream.
+    pub fin: bool,
+}
+
+/// Upstream HTTP/3 request prepared for real origin execution.
+#[derive(Debug)]
+pub struct Http3UpstreamRequest {
+    /// Target request header to send upstream.
+    pub request_header: RequestHeader,
+    /// Buffered request body chunks to send after the headers.
+    pub body: Vec<Http3UpstreamBodyChunk>,
+    /// Whether this request is safe to retry after transport failure.
+    pub replay_safe: bool,
+}
+
+impl Http3UpstreamRequest {
+    /// Create an upstream HTTP/3 request without a body.
+    pub fn new(request_header: RequestHeader) -> Self {
+        Self {
+            request_header,
+            body: Vec::new(),
+            replay_safe: false,
+        }
+    }
+
+    /// Attach body chunks to this request.
+    pub fn with_body(mut self, body: Vec<Http3UpstreamBodyChunk>) -> Self {
+        self.body = body;
+        self
+    }
+
+    /// Mark whether the request is safe to replay on retry.
+    pub fn with_replay_safe(mut self, replay_safe: bool) -> Self {
+        self.replay_safe = replay_safe;
+        self
+    }
+}
+
+/// Real upstream HTTP/3 response returned by an origin.
+#[derive(Debug)]
+pub struct Http3UpstreamResponse {
+    /// Response headers mapped into Pingora's response type.
+    pub response_header: ResponseHeader,
+    /// Buffered response body chunks received from the origin.
+    pub body: Vec<Http3BodyChunk>,
+    /// Whether response trailers are surfaced by the current boundary.
+    pub response_trailers_supported: bool,
+}
+
+/// Result of executing an upstream HTTP/3 request.
+#[derive(Debug)]
+pub enum Http3UpstreamOutcome {
+    /// The upstream request completed successfully.
+    Response(Box<Http3UpstreamResponse>),
+    /// Retry, failover, or fallback should be applied by the caller.
+    Retry(Http3RetryDecision),
+}
+
+/// Real upstream HTTP/3 executor backed by pooled H3-over-QUIC sessions.
+#[derive(Default)]
+pub struct Http3UpstreamExecutor {
+    pool: Http3UpstreamPool,
+    next_request_id: AtomicU64,
+}
+
+impl Http3UpstreamExecutor {
+    /// Create a new executor with an empty upstream H3 session pool.
+    pub fn new() -> Self {
+        Self {
+            pool: Http3UpstreamPool::new(),
+            next_request_id: AtomicU64::new(1),
+        }
+    }
+
+    /// Return pool lifecycle counters for the upstream H3 session pool.
+    pub fn pool_stats(&self) -> QuicUpstreamPoolStats {
+        self.pool.stats()
+    }
+
+    /// Map transport selection and peers into a concrete upstream target.
+    pub fn select_upstream(
+        &self,
+        transport: HttpUpstreamTransport,
+        stream_peer: Box<HttpPeer>,
+        http3_peer: Option<Box<Http3Peer>>,
+    ) -> Result<SelectedHttpUpstream> {
+        match transport {
+            HttpUpstreamTransport::Http1 | HttpUpstreamTransport::Http2 => {
+                Ok(SelectedHttpUpstream::Stream(stream_peer))
+            }
+            HttpUpstreamTransport::Http3 => Ok(SelectedHttpUpstream::Http3(
+                http3_peer.ok_or_else(|| {
+                    Error::explain(
+                        ErrorType::InternalError,
+                        "HTTP/3 upstream transport was selected without an Http3Peer",
+                    )
+                })?,
+            )),
+        }
+    }
+
+    /// Build a real QUIC connector config from an [`Http3Peer`].
+    pub fn connector_config(&self, peer: &Http3Peer) -> QuicConnectorConfig {
+        let mut config = QuicConnectorConfig::new(peer.authority.clone(), peer.address().clone())
+            .with_server_name(Some(peer.authority.clone()))
+            .with_alpn_protocols(peer.alpn.clone());
+
+        if let Some(local_bind_addr) = peer.local_bind_addr().cloned() {
+            config = config.with_local_bind_addr(Some(local_bind_addr));
+        }
+        if let Some(connect_timeout) = peer.connect_timeout() {
+            config = config.with_connect_timeout(connect_timeout);
+        }
+        if let Some(idle_timeout) = peer.idle_timeout() {
+            config = config.with_idle_timeout(idle_timeout);
+        }
+
+        config
+    }
+
+    /// Execute an upstream HTTP/3 request against the given origin.
+    pub async fn execute(
+        &self,
+        peer: &Http3Peer,
+        request: Http3UpstreamRequest,
+        classifier: &Http3RetryClassifier,
+    ) -> Result<Http3UpstreamOutcome> {
+        let connector = self.connector_config(peer);
+        let (session, _reused) = match self.pool.checkout(&connector).await {
+            Ok(result) => result,
+            Err(error) => {
+                return Ok(Http3UpstreamOutcome::Retry(
+                    classifier.classify_connect_error(&error),
+                ))
+            }
+        };
+
+        match self.execute_on_session(&session, peer, &request).await {
+            Ok(response) => {
+                self.pool.release(session);
+                Ok(Http3UpstreamOutcome::Response(Box::new(response)))
+            }
+            Err(error) => Ok(Http3UpstreamOutcome::Retry(
+                classifier.classify_proxy_error(
+                    &error,
+                    Http3RetryContext {
+                        request_can_retry: request.replay_safe,
+                    },
+                ),
+            )),
+        }
+    }
+
+    async fn execute_on_session(
+        &self,
+        session: &Http3UpstreamSession,
+        peer: &Http3Peer,
+        request: &Http3UpstreamRequest,
+    ) -> Result<Http3UpstreamResponse> {
+        let request_id = self.next_request_id.fetch_add(1, Ordering::Relaxed);
+        let headers = request_header_to_h3_headers(&request.request_header, peer)?;
+        let has_body = !request.body.is_empty();
+        let (body_writer_tx, body_writer_rx) = oneshot::channel();
+        session
+            .send_request(NewClientRequest {
+                request_id,
+                headers,
+                body_writer: has_body.then_some(body_writer_tx),
+            })
+            .await?;
+
+        if has_body {
+            let mut body_writer = body_writer_rx.await.map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 upstream body writer dropped before request body could be sent",
+                )
+            })?;
+            for chunk in &request.body {
+                body_writer
+                    .send(OutboundFrame::body(
+                        BufFactory::buf_from_slice(&chunk.data),
+                        chunk.fin,
+                    ))
+                    .await
+                    .map_err(|_| {
+                        Error::explain(
+                            ErrorType::WriteError,
+                            "HTTP/3 upstream body writer closed while sending request body",
+                        )
+                    })?;
+            }
+        }
+
+        let response = self.recv_response(session, request_id).await?;
+        Ok(response)
+    }
+
+    async fn recv_response(
+        &self,
+        session: &Http3UpstreamSession,
+        request_id: u64,
+    ) -> Result<Http3UpstreamResponse> {
+        let mut saw_request_open = false;
+        loop {
+            let Some(event) = session.recv_event().await else {
+                return Error::e_explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 upstream controller closed before a response was received",
+                );
+            };
+
+            match event {
+                ClientH3Event::NewOutboundRequest {
+                    request_id: seen_request_id,
+                    ..
+                } if seen_request_id == request_id => {
+                    saw_request_open = true;
+                }
+                ClientH3Event::Core(H3Event::IncomingHeaders(headers)) => {
+                    let response_header = response_header_from_h3_headers(&headers.headers)?;
+                    let body = read_http3_body(headers.recv, headers.read_fin).await?;
+                    return Ok(Http3UpstreamResponse {
+                        response_header,
+                        body,
+                        response_trailers_supported: false,
+                    });
+                }
+                ClientH3Event::Core(H3Event::ConnectionError(error)) => {
+                    return Err(Error::because(
+                        ErrorType::ConnectionClosed,
+                        "HTTP/3 upstream connection errored before response completion",
+                        error,
+                    ));
+                }
+                ClientH3Event::Core(H3Event::ConnectionShutdown(_)) => {
+                    return Error::e_explain(
+                        ErrorType::ConnectionClosed,
+                        if saw_request_open {
+                            "HTTP/3 upstream connection shut down before response completion"
+                        } else {
+                            "HTTP/3 upstream connection shut down before the request stream opened"
+                        },
+                    );
+                }
+                ClientH3Event::Core(H3Event::ResetStream { .. })
+                | ClientH3Event::Core(H3Event::StreamClosed { .. }) => {
+                    return Error::e_explain(
+                        ErrorType::ConnectionClosed,
+                        "HTTP/3 upstream stream closed before a complete response was received",
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// Bookkeeping counters for the HTTP/3 bridge.
@@ -441,6 +837,41 @@ impl Http3ProxyBridge {
             session: session.clone(),
             stream_id: accepted.stream_id,
             request_header,
+            body_reader: None,
+            response_writer: None,
+            request_trailers_supported: false,
+        })
+    }
+
+    /// Map real downstream HTTP/3 headers into a Pingora request.
+    pub fn accept_incoming_headers(
+        &self,
+        transport: QuicDownstreamSession,
+        incoming_headers: IncomingH3Headers,
+    ) -> Result<Http3DownstreamRequest> {
+        let request_header = self.build_request_from_h3_headers(&incoming_headers.headers)?;
+        let stream_id = incoming_headers.stream_id;
+        let flow_key = transport.flow_key.clone();
+
+        let mut sessions = self.sessions.lock().expect("http3 bridge mutex poisoned");
+        let session = sessions
+            .entry(flow_key)
+            .or_insert_with(|| Http3DownstreamSession {
+                transport: transport.clone(),
+                requests_seen: 0,
+            });
+
+        session.transport = transport;
+        session.requests_seen += 1;
+        self.stats.accepted_streams.fetch_add(1, Ordering::Relaxed);
+
+        Ok(Http3DownstreamRequest {
+            session: session.clone(),
+            stream_id,
+            request_header,
+            body_reader: Some(Http3BodyReader::new(incoming_headers.recv)),
+            response_writer: Some(Http3ResponseWriter::new(incoming_headers.send)),
+            request_trailers_supported: false,
         })
     }
 
@@ -464,6 +895,92 @@ impl Http3ProxyBridge {
         Ok(request)
     }
 
+    fn build_request_from_h3_headers(&self, headers: &[H3Header]) -> Result<RequestHeader> {
+        let mut method = None;
+        let mut path = None;
+        let mut authority = None;
+        let mut regular_headers: Vec<(String, Vec<u8>)> = Vec::new();
+
+        for header in headers {
+            let name = std::str::from_utf8(header.name()).map_err(|_| {
+                Error::explain(
+                    ErrorType::InvalidHTTPHeader,
+                    "HTTP/3 request header name is not valid UTF-8",
+                )
+            })?;
+            let value = header.value();
+
+            match name {
+                ":method" => {
+                    method = Some(Method::from_bytes(value).map_err(|_| {
+                        Error::explain(
+                            ErrorType::InvalidHTTPHeader,
+                            "HTTP/3 :method pseudo-header is invalid",
+                        )
+                    })?);
+                }
+                ":path" => path = Some(value.to_vec()),
+                ":authority" => {
+                    authority = Some(std::str::from_utf8(value).map_err(|_| {
+                        Error::explain(
+                            ErrorType::InvalidHTTPHeader,
+                            "HTTP/3 :authority pseudo-header is not valid UTF-8",
+                        )
+                    })?);
+                }
+                ":scheme" => {}
+                _ if name.starts_with(':') => {
+                    return Error::e_explain(
+                        ErrorType::InvalidHTTPHeader,
+                        format!("unsupported HTTP/3 pseudo-header {name}"),
+                    );
+                }
+                _ => regular_headers.push((name.to_string(), value.to_vec())),
+            }
+        }
+
+        let method = method.ok_or_else(|| {
+            Error::explain(
+                ErrorType::InvalidHTTPHeader,
+                "HTTP/3 request is missing :method pseudo-header",
+            )
+        })?;
+        let path = path.ok_or_else(|| {
+            Error::explain(
+                ErrorType::InvalidHTTPHeader,
+                "HTTP/3 request is missing :path pseudo-header",
+            )
+        })?;
+        let mut request = RequestHeader::build(method, &path, Some(regular_headers.len() + 1))?;
+        request.version = Version::HTTP_3;
+
+        if let Some(authority) = authority {
+            request.insert_header(HOST, authority)?;
+        }
+
+        for (name, value) in regular_headers {
+            if name.eq_ignore_ascii_case(CONNECTION.as_str())
+                || name.eq_ignore_ascii_case(UPGRADE.as_str())
+            {
+                return Error::e_explain(
+                    ErrorType::InvalidHTTPHeader,
+                    "HTTP/3 downstream bridge does not support Connection or Upgrade headers",
+                );
+            }
+            request.append_header(
+                name,
+                http::HeaderValue::from_bytes(&value).map_err(|_| {
+                    Error::explain(
+                        ErrorType::InvalidHTTPHeader,
+                        "HTTP/3 request header value is invalid",
+                    )
+                })?,
+            )?;
+        }
+
+        Ok(request)
+    }
+
     fn ensure_compatible_headers(&self, accepted: &Http3AcceptedStream) -> Result<()> {
         for (name, _) in &accepted.headers {
             if name.eq_ignore_ascii_case(CONNECTION.as_str())
@@ -480,23 +997,174 @@ impl Http3ProxyBridge {
     }
 }
 
+fn response_to_h3_headers(response: &ResponseHeader) -> Vec<H3Header> {
+    let mut headers = Vec::with_capacity(response.headers.len() + 1);
+    headers.push(H3Header::new(
+        b":status",
+        response.status.as_str().as_bytes(),
+    ));
+    for (name, value) in &response.headers {
+        headers.push(H3Header::new(name.as_str().as_bytes(), value.as_bytes()));
+    }
+    headers
+}
+
+fn request_header_to_h3_headers(
+    request: &RequestHeader,
+    peer: &Http3Peer,
+) -> Result<Vec<H3Header>> {
+    let path = request
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let authority = request
+        .headers
+        .get(HOST)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or(peer.authority());
+    let mut headers = vec![
+        H3Header::new(b":method", request.method.as_str().as_bytes()),
+        H3Header::new(b":scheme", b"https"),
+        H3Header::new(b":authority", authority.as_bytes()),
+        H3Header::new(b":path", path.as_bytes()),
+    ];
+
+    for (name, value) in &request.headers {
+        if name == HOST || name == CONNECTION || name == UPGRADE {
+            continue;
+        }
+        headers.push(H3Header::new(name.as_str().as_bytes(), value.as_bytes()));
+    }
+
+    Ok(headers)
+}
+
+fn response_header_from_h3_headers(headers: &[H3Header]) -> Result<ResponseHeader> {
+    let mut status = None;
+    let mut regular_headers: Vec<(String, Vec<u8>)> = Vec::new();
+
+    for header in headers {
+        let name = std::str::from_utf8(header.name()).map_err(|_| {
+            Error::explain(
+                ErrorType::InvalidHTTPHeader,
+                "HTTP/3 response header name is not valid UTF-8",
+            )
+        })?;
+        match name {
+            ":status" => {
+                let code = std::str::from_utf8(header.value()).map_err(|_| {
+                    Error::explain(
+                        ErrorType::InvalidHTTPHeader,
+                        "HTTP/3 response :status is not valid UTF-8",
+                    )
+                })?;
+                status = Some(code.parse::<u16>().map_err(|_| {
+                    Error::explain(
+                        ErrorType::InvalidHTTPHeader,
+                        "HTTP/3 response :status pseudo-header is invalid",
+                    )
+                })?);
+            }
+            _ if name.starts_with(':') => {
+                return Error::e_explain(
+                    ErrorType::InvalidHTTPHeader,
+                    format!("unsupported HTTP/3 response pseudo-header {name}"),
+                );
+            }
+            _ => regular_headers.push((name.to_string(), header.value().to_vec())),
+        }
+    }
+
+    let mut response = ResponseHeader::build(
+        status.ok_or_else(|| {
+            Error::explain(
+                ErrorType::InvalidHTTPHeader,
+                "HTTP/3 response is missing :status pseudo-header",
+            )
+        })?,
+        Some(regular_headers.len()),
+    )?;
+    response.version = Version::HTTP_3;
+    for (name, value) in regular_headers {
+        response.append_header(
+            name,
+            http::HeaderValue::from_bytes(&value).map_err(|_| {
+                Error::explain(
+                    ErrorType::InvalidHTTPHeader,
+                    "HTTP/3 response header value is invalid",
+                )
+            })?,
+        )?;
+    }
+    Ok(response)
+}
+
+async fn read_http3_body(
+    mut recv: InboundFrameStream,
+    read_fin: bool,
+) -> Result<Vec<Http3BodyChunk>> {
+    if read_fin {
+        return Ok(Vec::new());
+    }
+
+    let mut body = Vec::new();
+    while let Some(frame) = recv.recv().await {
+        match frame {
+            InboundFrame::Body(buf, fin) => {
+                body.push(Http3BodyChunk {
+                    data: buf.into_inner().into_vec(),
+                    fin,
+                });
+                if fin {
+                    break;
+                }
+            }
+            InboundFrame::Datagram(_) => {
+                return Error::e_explain(
+                    ErrorType::InternalError,
+                    "HTTP/3 upstream response path does not accept DATAGRAM frames",
+                )
+            }
+        }
+    }
+
+    Ok(body)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Http3AcceptedStream, Http3PhaseCompatibility, Http3ProxyBridge, Http3RetryAction,
-        Http3RetryClassifier, Http3RetryContext, Http3RetryPolicy, SelectedHttpUpstream,
+        Http3RetryClassifier, Http3RetryContext, Http3RetryPolicy, Http3UpstreamBodyChunk,
+        Http3UpstreamExecutor, Http3UpstreamOutcome, Http3UpstreamRequest, SelectedHttpUpstream,
     };
+    use futures::{SinkExt, StreamExt};
+    use http::header::HOST;
     use http::Version;
     use pingora_core::protocols::l4::datagram::{Datagram, DatagramFlowKey, DatagramMeta};
     use pingora_core::protocols::l4::socket::SocketAddr;
     use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport};
     use pingora_error::ErrorType;
-    use pingora_http::{Method, ResponseHeader};
+    use pingora_http::{Method, RequestHeader, ResponseHeader};
     use pingora_quic::{
         QuicConnectionMeta, QuicDownstreamSession, QuicIncomingDatagram, QuicSessionEvent,
     };
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Instant;
+    use tokio::sync::mpsc;
+    use tokio_quiche::buf_factory::BufFactory;
+    use tokio_quiche::http3::driver::{H3Event, ServerH3Event};
+    use tokio_quiche::http3::driver::{InboundFrame, IncomingH3Headers, OutboundFrame};
+    use tokio_quiche::http3::settings::Http3Settings;
+    use tokio_quiche::http3::H3AuditStats;
+    use tokio_quiche::metrics::DefaultMetrics;
+    use tokio_quiche::quiche::h3::{Header as H3Header, NameValue};
+    use tokio_quiche::settings::{
+        CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
+    };
+    use tokio_util::sync::PollSender;
 
     fn accepted_stream(event: QuicSessionEvent, stream_id: u64) -> Http3AcceptedStream {
         let local_addr = SocketAddr::Inet("127.0.0.1:4433".parse().unwrap());
@@ -537,6 +1205,141 @@ mod tests {
             authority: Some("example.com".to_string()),
             headers: vec![("x-test".to_string(), "1".to_string())],
         }
+    }
+
+    fn downstream_session() -> QuicDownstreamSession {
+        let local_addr = SocketAddr::Inet("127.0.0.1:4433".parse().unwrap());
+        let peer_addr = SocketAddr::Inet("127.0.0.1:50000".parse().unwrap());
+        QuicDownstreamSession {
+            flow_key: DatagramFlowKey {
+                listener_id: Arc::<str>::from("h3"),
+                local_addr: local_addr.clone(),
+                peer_addr: peer_addr.clone(),
+            },
+            meta: QuicConnectionMeta {
+                local_addr,
+                peer_addr,
+                alpn_protocol: Some(b"h3".to_vec()),
+                server_name: Some("example.com".to_string()),
+                resumed: false,
+            },
+            established_at: Instant::now(),
+            last_seen: Instant::now(),
+            packets_received: 1,
+            stream_handle: None,
+        }
+    }
+
+    fn upstream_peer(port: u16) -> Http3Peer {
+        let mut peer = Http3Peer::new(("127.0.0.1", port), "localhost".to_string());
+        peer.options = peer
+            .options
+            .clone()
+            .with_connect_timeout(Some(std::time::Duration::from_secs(2)))
+            .with_idle_timeout(Some(std::time::Duration::from_secs(30)));
+        peer
+    }
+
+    fn upstream_request(method: Method, path: &[u8]) -> Http3UpstreamRequest {
+        let mut request = RequestHeader::build(method, path, Some(2)).unwrap();
+        request.insert_header(HOST, "localhost").unwrap();
+        Http3UpstreamRequest::new(request)
+    }
+
+    fn quic_test_cert_paths() -> (String, String) {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../pingora-core/tests/certs");
+        (
+            root.join("server.crt").display().to_string(),
+            root.join("server.key").display().to_string(),
+        )
+    }
+
+    async fn spawn_http3_origin() -> std::io::Result<std::net::SocketAddr> {
+        let (cert_path, key_path) = quic_test_cert_paths();
+        let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await?;
+        let addr = socket.local_addr()?;
+        let mut settings = QuicSettings::default();
+        settings.alpn = vec![b"h3".to_vec()];
+        settings.verify_peer = false;
+        let params = ConnectionParams::new_server(
+            settings,
+            TlsCertificatePaths {
+                cert: &cert_path,
+                private_key: &key_path,
+                kind: CertificateKind::X509,
+            },
+            Hooks::default(),
+        );
+        let mut listeners = tokio_quiche::listen([socket], params, DefaultMetrics)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+
+        tokio::spawn(async move {
+            let accept_stream = &mut listeners[0];
+            while let Some(result) = accept_stream.next().await {
+                let Ok(connection) = result else {
+                    continue;
+                };
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(Http3Settings::default());
+                connection.start(driver);
+                tokio::spawn(async move {
+                    while let Some(event) = controller.event_receiver_mut().recv().await {
+                        match event {
+                            ServerH3Event::Headers {
+                                incoming_headers, ..
+                            } => {
+                                let IncomingH3Headers {
+                                    headers,
+                                    mut send,
+                                    mut recv,
+                                    ..
+                                } = incoming_headers;
+                                let path = headers
+                                    .iter()
+                                    .find(|header| header.name() == b":path")
+                                    .map(|header| {
+                                        String::from_utf8_lossy(header.value()).into_owned()
+                                    })
+                                    .unwrap_or_else(|| "/".to_string());
+                                let mut request_body = Vec::new();
+                                while let Some(frame) = recv.recv().await {
+                                    match frame {
+                                        InboundFrame::Body(buf, fin) => {
+                                            request_body.extend_from_slice(&buf);
+                                            if fin {
+                                                break;
+                                            }
+                                        }
+                                        InboundFrame::Datagram(_) => {}
+                                    }
+                                }
+                                let mut response_body = format!("{}|", path).into_bytes();
+                                response_body.extend_from_slice(&request_body);
+                                send.send(OutboundFrame::Headers(
+                                    vec![
+                                        H3Header::new(b":status", b"200"),
+                                        H3Header::new(b"x-origin", b"tokio-quiche"),
+                                    ],
+                                    None,
+                                ))
+                                .await
+                                .unwrap();
+                                send.send(OutboundFrame::body(
+                                    BufFactory::buf_from_slice(&response_body),
+                                    true,
+                                ))
+                                .await
+                                .unwrap();
+                            }
+                            ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
+                            _ => {}
+                        }
+                    }
+                });
+            }
+        });
+
+        Ok(addr)
     }
 
     #[test]
@@ -596,6 +1399,133 @@ mod tests {
                 "HTTP/3 does not support HTTP/1.x Upgrade/Connection semantics"
             )
         );
+    }
+
+    #[tokio::test]
+    async fn bridge_maps_real_http3_headers_and_reads_request_body() {
+        let bridge = Http3ProxyBridge::new();
+        let (body_tx, body_rx) = mpsc::channel(4);
+        let (response_tx, _response_rx) = mpsc::channel(4);
+        body_tx
+            .send(InboundFrame::Body(
+                BufFactory::buf_from_slice(b"ping"),
+                false,
+            ))
+            .await
+            .unwrap();
+        body_tx
+            .send(InboundFrame::Body(
+                BufFactory::buf_from_slice(b"pong"),
+                true,
+            ))
+            .await
+            .unwrap();
+        drop(body_tx);
+
+        let incoming_headers = IncomingH3Headers {
+            stream_id: 4,
+            headers: vec![
+                H3Header::new(b":method", b"POST"),
+                H3Header::new(b":path", b"/submit"),
+                H3Header::new(b":authority", b"example.com"),
+                H3Header::new(b"x-test", b"1"),
+            ],
+            send: PollSender::new(response_tx),
+            recv: body_rx,
+            read_fin: false,
+            h3_audit_stats: Arc::new(H3AuditStats::new(4)),
+        };
+
+        let mut request = bridge
+            .accept_incoming_headers(downstream_session(), incoming_headers)
+            .unwrap();
+
+        assert_eq!(request.stream_id, 4);
+        assert_eq!(request.request_header.version, Version::HTTP_3);
+        assert_eq!(request.request_header.method, Method::POST);
+        assert_eq!(request.request_header.uri.path(), "/submit");
+        assert_eq!(
+            request
+                .request_header
+                .headers
+                .get(http::header::HOST)
+                .unwrap(),
+            "example.com"
+        );
+        assert!(!request.request_trailers_supported);
+
+        let mut body = request.body_reader.take().unwrap();
+        let first = body.recv_chunk().await.unwrap().unwrap();
+        assert_eq!(first.data, b"ping");
+        assert!(!first.fin);
+        let second = body.recv_chunk().await.unwrap().unwrap();
+        assert_eq!(second.data, b"pong");
+        assert!(second.fin);
+        assert!(body.recv_chunk().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_writes_real_http3_response_frames() {
+        let bridge = Http3ProxyBridge::new();
+        let (_body_tx, body_rx) = mpsc::channel(1);
+        let (response_tx, mut response_rx) = mpsc::channel(4);
+        let incoming_headers = IncomingH3Headers {
+            stream_id: 8,
+            headers: vec![
+                H3Header::new(b":method", b"GET"),
+                H3Header::new(b":path", b"/health"),
+            ],
+            send: PollSender::new(response_tx),
+            recv: body_rx,
+            read_fin: true,
+            h3_audit_stats: Arc::new(H3AuditStats::new(8)),
+        };
+
+        let mut request = bridge
+            .accept_incoming_headers(downstream_session(), incoming_headers)
+            .unwrap();
+        let mut writer = request.response_writer.take().unwrap();
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        response.insert_header("x-served-by", "pingora").unwrap();
+
+        writer.send_response_header(&response).await.unwrap();
+        writer.send_body(b"ok", false).await.unwrap();
+        writer
+            .send_trailers(&[("x-finished", "true")])
+            .await
+            .unwrap();
+
+        let headers = response_rx.recv().await.unwrap();
+        match headers {
+            OutboundFrame::Headers(headers, _) => {
+                assert!(headers
+                    .iter()
+                    .any(|header| header.name() == b":status" && header.value() == b"200"));
+                assert!(headers
+                    .iter()
+                    .any(|header| header.name() == b"x-served-by" && header.value() == b"pingora"));
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let body = response_rx.recv().await.unwrap();
+        match body {
+            OutboundFrame::Body(buf, fin) => {
+                assert_eq!(&buf[..], b"ok");
+                assert!(!fin);
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+
+        let trailers = response_rx.recv().await.unwrap();
+        match trailers {
+            OutboundFrame::Trailers(headers, _) => {
+                assert_eq!(headers.len(), 1);
+                assert_eq!(headers[0].name(), b"x-finished");
+                assert_eq!(headers[0].value(), b"true");
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
     }
 
     #[test]
@@ -725,5 +1655,133 @@ mod tests {
         );
         assert_eq!(unsafe_decision.action, Http3RetryAction::Fail);
         assert!(!unsafe_decision.mark_retryable);
+    }
+
+    #[test]
+    fn upstream_executor_maps_http3_peer_into_connector_config() {
+        let executor = Http3UpstreamExecutor::new();
+        let peer = upstream_peer(8443);
+        let config = executor.connector_config(&peer);
+
+        assert_eq!(config.peer_addr, *peer.address());
+        assert_eq!(config.server_name.as_deref(), Some("localhost"));
+        assert_eq!(config.alpn_protocols, vec![b"h3".to_vec()]);
+        assert_eq!(config.connect_timeout, std::time::Duration::from_secs(2));
+        assert_eq!(config.idle_timeout, std::time::Duration::from_secs(30));
+    }
+
+    #[test]
+    fn upstream_executor_selects_requested_transport() {
+        let executor = Http3UpstreamExecutor::new();
+        let stream_peer = Box::new(HttpPeer::new(
+            ("127.0.0.1", 8080),
+            false,
+            "example.com".into(),
+        ));
+        let http3_peer = Box::new(Http3Peer::new(("127.0.0.1", 8443), "example.com".into()));
+
+        let selected = executor
+            .select_upstream(
+                HttpUpstreamTransport::Http3,
+                stream_peer.clone(),
+                Some(http3_peer),
+            )
+            .unwrap();
+        assert_eq!(selected.transport(), HttpUpstreamTransport::Http3);
+
+        let selected = executor
+            .select_upstream(HttpUpstreamTransport::Http1, stream_peer, None)
+            .unwrap();
+        assert_eq!(selected.transport(), HttpUpstreamTransport::Http1);
+    }
+
+    #[tokio::test]
+    async fn upstream_executor_round_trips_real_http3_requests() {
+        let origin_addr = match spawn_http3_origin().await {
+            Ok(addr) => addr,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to start HTTP/3 origin: {error}"),
+        };
+        let executor = Http3UpstreamExecutor::new();
+        let peer = upstream_peer(origin_addr.port());
+        let request = upstream_request(Method::POST, b"/echo").with_body(vec![
+            Http3UpstreamBodyChunk {
+                data: b"ping".to_vec(),
+                fin: false,
+            },
+            Http3UpstreamBodyChunk {
+                data: b"pong".to_vec(),
+                fin: true,
+            },
+        ]);
+        let classifier = Http3RetryClassifier::default();
+
+        let outcome = executor.execute(&peer, request, &classifier).await.unwrap();
+        let Http3UpstreamOutcome::Response(response) = outcome else {
+            panic!("expected upstream response");
+        };
+        assert_eq!(response.response_header.status, 200);
+        assert_eq!(
+            response.response_header.headers.get("x-origin").unwrap(),
+            "tokio-quiche"
+        );
+        let mut body = Vec::new();
+        let mut saw_fin = false;
+        for chunk in &response.body {
+            body.extend_from_slice(&chunk.data);
+            saw_fin |= chunk.fin;
+        }
+        assert_eq!(body, b"/echo|pingpong");
+        assert!(saw_fin);
+        assert!(!response.response_trailers_supported);
+    }
+
+    #[tokio::test]
+    async fn upstream_executor_returns_retry_decision_on_connect_failure() {
+        let executor = Http3UpstreamExecutor::new();
+        let peer = upstream_peer(9);
+        let classifier = Http3RetryClassifier::default();
+        let request = upstream_request(Method::GET, b"/health").with_replay_safe(true);
+
+        let outcome = executor.execute(&peer, request, &classifier).await.unwrap();
+        let Http3UpstreamOutcome::Retry(decision) = outcome else {
+            panic!("expected retry decision");
+        };
+        assert_eq!(
+            decision.action,
+            Http3RetryAction::Fallback(HttpUpstreamTransport::Http2)
+        );
+        assert!(decision.mark_retryable);
+    }
+
+    #[tokio::test]
+    async fn upstream_executor_reuses_pooled_http3_sessions() {
+        let origin_addr = match spawn_http3_origin().await {
+            Ok(addr) => addr,
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(error) => panic!("failed to start HTTP/3 origin: {error}"),
+        };
+        let executor = Http3UpstreamExecutor::new();
+        let peer = upstream_peer(origin_addr.port());
+        let classifier = Http3RetryClassifier::default();
+
+        let first = executor
+            .execute(&peer, upstream_request(Method::GET, b"/one"), &classifier)
+            .await
+            .unwrap();
+        assert!(matches!(first, Http3UpstreamOutcome::Response(_)));
+        assert_eq!(executor.pool_stats().released_sessions, 1);
+
+        let second = executor
+            .execute(&peer, upstream_request(Method::GET, b"/two"), &classifier)
+            .await
+            .unwrap();
+        let Http3UpstreamOutcome::Response(response) = second else {
+            panic!("expected second upstream response");
+        };
+        assert_eq!(response.body[0].data, b"/two|");
+        let stats = executor.pool_stats();
+        assert_eq!(stats.reused_sessions, 1);
+        assert_eq!(stats.released_sessions, 2);
     }
 }

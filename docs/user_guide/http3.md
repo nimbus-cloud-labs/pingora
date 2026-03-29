@@ -7,8 +7,8 @@ What exists today:
 
 - downstream HTTP/3 negotiation and `alt-svc` advertisement
 - a QUIC transport boundary in `pingora-quic`
-- downstream HTTP/3 request bridging into Pingora's request model
-- upstream HTTP/3 peer selection, QUIC session pooling, and retry classification
+- downstream HTTP/3 request, body, and response bridging into Pingora's request model
+- upstream HTTP/3 peer selection, pooled session execution, and retry classification
 
 What is still incomplete:
 
@@ -59,6 +59,9 @@ Current downstream compatibility is intentionally conservative:
 
 - generic request and response phases remain reusable
 - HTTP/1.x `Connection` and `Upgrade` semantics are rejected for HTTP/3 requests
+- downstream request bodies are surfaced as explicit HTTP/3 body chunks
+- downstream response headers, body bytes, and response trailers can be written back on real HTTP/3 streams
+- downstream request trailers are not surfaced by the current backend and must be treated as unsupported
 - use `Http3CompatibilityReport` if you need an explicit view of supported phases
 
 ## Upstream HTTP/3
@@ -91,6 +94,21 @@ peer.options = peer
 
 The upstream transport choice is explicit via `HttpUpstreamTransport`.
 
+`pingora-proxy` also exposes `Http3UpstreamExecutor`, which currently provides:
+
+- `Http3Peer` to real `QuicConnectorConfig` mapping
+- pooled HTTP/3 session checkout and release
+- real request header and request body execution toward an origin
+- real response header and response body mapping back into Pingora types
+- retry/fallback outcomes based on `Http3RetryClassifier`
+
+Current upstream HTTP/3 limits are still conservative:
+
+- request bodies are supported as buffered body chunks
+- response bodies are surfaced as buffered body chunks
+- upstream request trailers are not modeled yet
+- upstream response trailers are not surfaced by the current boundary and must be treated as unsupported
+
 ## QUIC Session Reuse
 
 Pingora keeps QUIC upstream reuse separate from TCP connection pools.
@@ -104,6 +122,10 @@ Pingora keeps QUIC upstream reuse separate from TCP connection pools.
 
 This keeps QUIC lifecycle rules visible instead of implicitly reusing the TCP
 pooling model.
+
+For real upstream HTTP/3 requests, `pingora-quic::Http3UpstreamPool` builds on
+the same idea but keeps the HTTP/3 controller and QUIC session together for
+pooled reuse.
 
 ## Example
 
@@ -154,5 +176,5 @@ Today, the safe way to think about HTTP/3 support in Pingora is:
 
 - QUIC transport boundary: implemented
 - downstream negotiation and request bridge: implemented
-- upstream HTTP/3 peer and session lifecycle: implemented
+- upstream HTTP/3 peer selection, pooled execution, and retry outcome wiring: implemented
 - fully integrated end-to-end HTTP/3 proxy path: still in progress

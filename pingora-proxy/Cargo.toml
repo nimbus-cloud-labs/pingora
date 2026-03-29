@@ -27,6 +27,7 @@ pingora-error = { version = "0.9.0", path = "../pingora-error" }
 pingora-core = { version = "0.9.0", path = "../pingora-core", default-features = false }
 pingora-cache = { version = "0.9.0", path = "../pingora-cache", default-features = false }
 pingora-quic = { version = "0.9.0", path = "../pingora-quic", optional = true }
+tokio-quiche = { version = "0.16.1", optional = true }
 tokio = { workspace = true, features = ["macros", "net"] }
 pingora-http = { version = "0.9.0", path = "../pingora-http" }
 http = { workspace = true }
@@ -61,6 +62,7 @@ futures-util = "0.3"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
+tokio-util = "0.7"
 
 [target.'cfg(unix)'.dev-dependencies]
 hyperlocal = "0.9"
@@ -82,7 +84,7 @@ patched_http1 = ["pingora-core/patched_http1"]
 upstream_modules = []
 connection_filter = ["pingora-core/connection_filter"]
 trace = ["pingora-cache/trace"]
-http3 = ["dep:pingora-quic"]
+http3 = ["dep:pingora-quic", "dep:tokio-quiche", "pingora-quic/tokio-quiche", "tokio/sync"]
 
 [[example]]
 name = "connection_filter"

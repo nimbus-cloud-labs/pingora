@@ -104,8 +104,10 @@ pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeTy
 pub use proxy_h3::{
     DownstreamHttpVersion, Http3AcceptedStream, Http3BridgeStats, Http3CompatibilityReport,
     Http3DownstreamRequest, Http3DownstreamSession, Http3Negotiation, Http3PhaseCompatibility,
-    Http3ProxyBridge, Http3RetryAction, Http3RetryClassifier, Http3RetryContext,
-    Http3RetryDecision, Http3RetryPolicy, SelectedHttpUpstream,
+    Http3ProxyBridge, Http3ResponseWriter, Http3RetryAction, Http3RetryClassifier,
+    Http3RetryContext, Http3RetryDecision, Http3RetryPolicy, Http3UpstreamBodyChunk,
+    Http3UpstreamExecutor, Http3UpstreamOutcome, Http3UpstreamRequest, Http3UpstreamResponse,
+    SelectedHttpUpstream,
 };
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
@@ -115,6 +117,7 @@ pub mod prelude {
     #[cfg(feature = "http3")]
     pub use crate::{
         Http3AcceptedStream, Http3DownstreamRequest, Http3Negotiation, Http3ProxyBridge,
+        Http3UpstreamExecutor, Http3UpstreamRequest,
     };
 }
 

@@ -65,6 +65,11 @@ The main explicit incompatibility today is downstream HTTP/1.x upgrade semantics
 use `Connection: upgrade` or `Upgrade: ...`, so logic that depends on downstream upgrade handling
 must be treated as unsupported on the HTTP/3 path until a protocol-native alternative is added.
 
+Downstream HTTP/3 request bodies now flow through the bridge as real body chunks, so
+`request_body_filter()` and downstream response body filters remain valid on this path. The main
+remaining body-level gap is request trailers: the current backend does not surface them to Pingora,
+so request-trailer-specific logic is still unsupported for HTTP/3.
+
 ### General filter usage guidelines
 * Most filters return a [`pingora_error::Result<_>`](errors.md). When the returned value is `Result::Err`, `fail_to_proxy()` will be called and the request will be terminated.
 * Most filters are async functions, which allows other async operations such as IO to be performed within the filters.

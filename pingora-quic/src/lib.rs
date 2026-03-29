@@ -35,6 +35,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
+#[cfg(feature = "tokio-quiche")]
+use tokio_quiche::http3::driver::{ClientH3Controller, ClientH3Event, NewClientRequest};
 
 /// Certificate formats supported by QUIC transport backends.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -980,6 +982,84 @@ impl QuicUpstreamSession {
     }
 }
 
+/// An HTTP/3-capable upstream session built on top of a live QUIC session.
+#[cfg(feature = "tokio-quiche")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio-quiche")))]
+#[derive(Clone)]
+pub struct Http3UpstreamSession {
+    quic: QuicUpstreamSession,
+    controller: Arc<AsyncMutex<ClientH3Controller>>,
+}
+
+#[cfg(feature = "tokio-quiche")]
+impl Http3UpstreamSession {
+    fn new(quic: QuicUpstreamSession, controller: ClientH3Controller) -> Self {
+        Self {
+            quic,
+            controller: Arc::new(AsyncMutex::new(controller)),
+        }
+    }
+
+    /// Return transport metadata for the underlying QUIC session.
+    pub fn meta(&self) -> &QuicConnectionMeta {
+        &self.quic.meta
+    }
+
+    /// Return the logical upstream destination for the session.
+    pub fn destination(&self) -> &QuicUpstreamDestination {
+        &self.quic.destination
+    }
+
+    /// Return how many times this session has been reused from a pool.
+    pub fn reuse_count(&self) -> u64 {
+        self.quic.reuse_count
+    }
+
+    /// Return whether this session was resumed from a pool checkout.
+    pub fn resumed(&self) -> bool {
+        self.quic.meta.resumed
+    }
+
+    fn mark_checked_out(&mut self, now: Instant) {
+        self.quic.last_used_at = now;
+        self.quic.reuse_count += 1;
+        self.quic.meta.resumed = true;
+    }
+
+    fn mark_released(&mut self) {
+        self.quic.last_used_at = Instant::now();
+    }
+
+    fn is_alive(&self, now: Instant) -> bool {
+        now.duration_since(self.quic.last_used_at) < self.quic.idle_timeout
+    }
+
+    /// Send a client-side HTTP/3 request command on this session.
+    pub async fn send_request(&self, request: NewClientRequest) -> Result<()> {
+        self.controller
+            .lock()
+            .await
+            .request_sender()
+            .send(request)
+            .map_err(|_| {
+                Error::explain(
+                    ErrorType::ConnectionClosed,
+                    "HTTP/3 upstream controller closed before request could be sent",
+                )
+            })
+    }
+
+    /// Receive the next HTTP/3 client event from this session.
+    pub async fn recv_event(&self) -> Option<ClientH3Event> {
+        self.controller
+            .lock()
+            .await
+            .event_receiver_mut()
+            .recv()
+            .await
+    }
+}
+
 /// Snapshot of lifecycle counters for the QUIC upstream session pool.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QuicUpstreamPoolStats {
@@ -1130,6 +1210,125 @@ impl QuicUpstreamPool {
     }
 }
 
+/// A pool of reusable upstream HTTP/3 sessions backed by QUIC.
+#[cfg(feature = "tokio-quiche")]
+#[cfg_attr(docsrs, doc(cfg(feature = "tokio-quiche")))]
+#[derive(Default)]
+pub struct Http3UpstreamPool {
+    sessions: Mutex<HashMap<u64, Vec<Http3UpstreamSession>>>,
+    stats: QuicUpstreamPoolStatsInner,
+}
+
+#[cfg(feature = "tokio-quiche")]
+impl Http3UpstreamPool {
+    /// Create an empty HTTP/3 upstream session pool.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Return pool lifecycle counters.
+    pub fn stats(&self) -> QuicUpstreamPoolStats {
+        self.stats.snapshot()
+    }
+
+    /// Return the number of pooled HTTP/3 sessions currently retained.
+    pub fn pooled_sessions(&self) -> usize {
+        self.sessions.lock().values().map(std::vec::Vec::len).sum()
+    }
+
+    /// Obtain a pooled HTTP/3 session if one is still alive, otherwise establish a new one.
+    pub async fn checkout(
+        &self,
+        connector: &QuicConnectorConfig,
+    ) -> Result<(Http3UpstreamSession, bool)> {
+        let destination = QuicUpstreamDestination::from(connector);
+        let key = upstream_pool_key(&destination);
+        let now = Instant::now();
+        let (mut reused_session, expired) = {
+            let mut sessions = self.sessions.lock();
+            let mut expired = 0u64;
+            let mut reused_session = None;
+
+            if let Some(pool) = sessions.get_mut(&key) {
+                pool.retain(|session| {
+                    let alive = session.is_alive(now);
+                    if !alive {
+                        expired += 1;
+                    }
+                    alive
+                });
+
+                reused_session = pool.pop();
+                if pool.is_empty() {
+                    sessions.remove(&key);
+                }
+            }
+
+            (reused_session, expired)
+        };
+
+        if expired > 0 {
+            self.stats
+                .expired_sessions
+                .fetch_add(expired, Ordering::Relaxed);
+            observe_quic_event("h3_pool", &destination.name, "session_expired");
+        }
+
+        if let Some(mut session) = reused_session.take() {
+            session.mark_checked_out(now);
+            self.stats.reused_sessions.fetch_add(1, Ordering::Relaxed);
+            observe_quic_event("h3_pool", &destination.name, "session_reused");
+            return Ok((session, true));
+        }
+
+        #[cfg(feature = "tokio-quiche")]
+        let session =
+            tokio_quiche_adapter::establish_http3_upstream(connector, &self.stats).await?;
+
+        self.stats
+            .established_sessions
+            .fetch_add(1, Ordering::Relaxed);
+        observe_quic_event("h3_pool", &destination.name, "session_established");
+        Ok((session, false))
+    }
+
+    /// Return an upstream HTTP/3 session to the pool.
+    pub fn release(&self, mut session: Http3UpstreamSession) {
+        let key = upstream_pool_key(session.destination());
+        let destination = session.destination().clone();
+        session.mark_released();
+        self.sessions.lock().entry(key).or_default().push(session);
+        self.stats.released_sessions.fetch_add(1, Ordering::Relaxed);
+        observe_quic_event("h3_pool", &destination.name, "session_released");
+    }
+
+    /// Remove expired HTTP/3 sessions from the pool and return how many were removed.
+    pub fn prune_expired(&self) -> usize {
+        let now = Instant::now();
+        let mut sessions = self.sessions.lock();
+        let mut expired = 0usize;
+
+        sessions.retain(|_, pool| {
+            pool.retain(|session| {
+                let alive = session.is_alive(now);
+                if !alive {
+                    expired += 1;
+                    observe_quic_event("h3_pool", &session.destination().name, "session_expired");
+                }
+                alive
+            });
+            !pool.is_empty()
+        });
+
+        if expired > 0 {
+            self.stats
+                .expired_sessions
+                .fetch_add(expired as u64, Ordering::Relaxed);
+        }
+        expired
+    }
+}
+
 /// The transport boundary Pingora expects from a QUIC implementation.
 #[async_trait]
 pub trait QuicTransport: Send + Sync {
@@ -1167,12 +1366,12 @@ impl QuicTransport for NoopQuicTransport {
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio-quiche")))]
 pub mod tokio_quiche_adapter {
     use super::{
-        default_local_addr_for, observe_quic_event, QuicBackend, QuicCertificateKind,
-        QuicConnectionMeta, QuicConnectorConfig, QuicConnectorHandle, QuicDownstreamCloseEvent,
-        QuicDownstreamSession, QuicListenerConfig, QuicListenerStats, QuicListenerStatsInner,
-        QuicStreamCommand, QuicStreamController, QuicStreamDirection, QuicStreamEvent,
-        QuicStreamHandle,
-        QuicTlsCertificate, QuicTransport, QuicUpstreamSession, Result,
+        default_local_addr_for, observe_quic_event, Http3UpstreamSession, QuicBackend,
+        QuicCertificateKind, QuicConnectionMeta, QuicConnectorConfig, QuicConnectorHandle,
+        QuicDownstreamCloseEvent, QuicDownstreamSession, QuicListenerConfig, QuicListenerStats,
+        QuicListenerStatsInner, QuicStreamCommand, QuicStreamController, QuicStreamDirection,
+        QuicStreamEvent, QuicStreamHandle, QuicTlsCertificate, QuicTransport, QuicUpstreamSession,
+        Result,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -1187,12 +1386,14 @@ pub mod tokio_quiche_adapter {
     use tokio::net::UdpSocket;
     use tokio::sync::{mpsc, oneshot, Mutex as AsyncMutex};
     use tokio::time::timeout;
-    use tokio_quiche::quic::connect_with_config;
+    use tokio_quiche::http3::driver::ClientH3Driver;
+    use tokio_quiche::http3::settings::Http3Settings;
     use tokio_quiche::metrics::DefaultMetrics;
-    use tokio_quiche::socket::Socket as ConnectedSocket;
+    use tokio_quiche::quic::connect_with_config;
     use tokio_quiche::settings::{
         CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
     };
+    use tokio_quiche::socket::Socket as ConnectedSocket;
     use tokio_stream::StreamExt;
 
     #[derive(Debug, Clone, Default)]
@@ -1263,10 +1464,7 @@ pub mod tokio_quiche_adapter {
             Ok(())
         }
 
-        fn enqueue_writable_events(
-            &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
-        ) {
+        fn enqueue_writable_events(&mut self, qconn: &mut tokio_quiche::quiche::Connection) {
             for stream_id in qconn.writable() {
                 if self.writable_streams.insert(stream_id) {
                     let _ = self.event_tx.send(QuicStreamEvent::Writable { stream_id });
@@ -1778,7 +1976,9 @@ pub mod tokio_quiche_adapter {
                 local_addr: SocketAddr::Inet(connection.local_addr()),
                 peer_addr: SocketAddr::Inet(connection.peer_addr()),
                 alpn_protocol: negotiated.alpn_protocol,
-                server_name: negotiated.server_name.or_else(|| config.server_name.clone()),
+                server_name: negotiated
+                    .server_name
+                    .or_else(|| config.server_name.clone()),
                 resumed: false,
             },
             established_at,
@@ -1788,6 +1988,89 @@ pub mod tokio_quiche_adapter {
             reuse_count: 0,
             stream_handle: Some(stream_handle),
         })
+    }
+
+    pub(crate) async fn establish_http3_upstream(
+        config: &QuicConnectorConfig,
+        _stats: &super::QuicUpstreamPoolStatsInner,
+    ) -> Result<Http3UpstreamSession> {
+        let transport = TokioQuicheTransport::new();
+        let params = transport.build_connector_params(config)?;
+        let bind_addr = config
+            .local_bind_addr
+            .clone()
+            .unwrap_or_else(|| default_local_addr_for(&config.peer_addr));
+        let local_addr = *bind_addr
+            .as_inet()
+            .expect("validated inet socket address for tokio-quiche bind");
+        let peer_addr = *config
+            .peer_addr
+            .as_inet()
+            .expect("validated inet socket address for tokio-quiche peer");
+        let socket = UdpSocket::bind(local_addr).await.map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "binding tokio-quiche HTTP/3 upstream UDP socket",
+                error,
+            )
+        })?;
+        socket.connect(peer_addr).await.map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "connecting tokio-quiche HTTP/3 upstream UDP socket",
+                error,
+            )
+        })?;
+        let socket = ConnectedSocket::try_from(socket).map_err(|error| {
+            Error::because(
+                ErrorType::ConnectError,
+                "wrapping tokio-quiche HTTP/3 upstream socket",
+                error,
+            )
+        })?;
+
+        let (driver, controller) = ClientH3Driver::new(Http3Settings::default());
+        observe_quic_event("h3_pool", &config.name, "session_establish_started");
+        let connection = timeout(
+            config.connect_timeout,
+            connect_with_config(socket, config.server_name.as_deref(), &params, driver),
+        )
+        .await
+        .map_err(|_| {
+            observe_quic_event("h3_pool", &config.name, "session_establish_timeout");
+            Error::explain(
+                ErrorType::ConnectTimedout,
+                "tokio-quiche HTTP/3 upstream handshake timed out before session establishment",
+            )
+        })?
+        .map_err(|error| {
+            observe_quic_event("h3_pool", &config.name, "session_establish_failed");
+            Error::because(
+                ErrorType::TLSHandshakeFailure,
+                "establishing tokio-quiche HTTP/3 upstream session",
+                error,
+            )
+        })?;
+
+        let established_at = Instant::now();
+        let session = QuicUpstreamSession {
+            destination: super::QuicUpstreamDestination::from(config),
+            meta: QuicConnectionMeta {
+                local_addr: SocketAddr::Inet(connection.local_addr()),
+                peer_addr: SocketAddr::Inet(connection.peer_addr()),
+                alpn_protocol: config.alpn_protocols.first().cloned(),
+                server_name: config.server_name.clone(),
+                resumed: false,
+            },
+            established_at,
+            connect_timeout: config.connect_timeout,
+            idle_timeout: config.idle_timeout,
+            last_used_at: established_at,
+            reuse_count: 0,
+            stream_handle: None,
+        };
+        observe_quic_event("h3_pool", &config.name, "session_established");
+        Ok(Http3UpstreamSession::new(session, controller))
     }
 
     #[async_trait]
@@ -1937,9 +2220,11 @@ mod tests {
 
     #[cfg(feature = "tokio-quiche")]
     fn downstream_listener_tls() -> QuicTlsCertificate {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../pingora-core/tests/certs");
         QuicTlsCertificate::new(
-            "pingora-core/tests/certs/server.crt",
-            "pingora-core/tests/certs/server.key",
+            root.join("server.crt").display().to_string(),
+            root.join("server.key").display().to_string(),
             QuicCertificateKind::X509,
         )
     }
@@ -2244,7 +2529,20 @@ mod tests {
         let listener = downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
             .with_tls_certificate(Some(downstream_listener_tls()));
 
-        let handle = transport.bind_listener(listener).await.unwrap();
+        let handle = match transport.bind_listener(listener).await {
+            Ok(handle) => handle,
+            Err(error)
+                if error.etype() == &ErrorType::BindError
+                    && error.cause.as_ref().is_some_and(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    }) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind tokio-quiche listener: {error:?}"),
+        };
         assert_eq!(handle.config().name.as_ref(), "h3-listener");
         assert_eq!(handle.backend(), QuicBackend::TokioQuiche);
     }
@@ -2330,7 +2628,20 @@ mod tests {
         let transport = TokioQuicheTransport::new();
         let config = downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
             .with_tls_certificate(Some(downstream_listener_tls()));
-        let listener = transport.bind_listener(config).await.unwrap();
+        let listener = match transport.bind_listener(config).await {
+            Ok(listener) => listener,
+            Err(error)
+                if error.etype() == &ErrorType::BindError
+                    && error.cause.as_ref().is_some_and(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    }) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind tokio-quiche listener: {error:?}"),
+        };
         let server_addr = *listener.local_addr().unwrap().as_inet().unwrap();
 
         let client_task = tokio::spawn(async move {
@@ -2366,9 +2677,7 @@ mod tests {
         use super::tokio_quiche_adapter::TokioQuicheTransport;
         use tokio::time::{timeout, Duration as TokioDuration};
 
-        async fn recv_until_data(
-            session: &super::QuicDownstreamSession,
-        ) -> (u64, Vec<u8>, bool) {
+        async fn recv_until_data(session: &super::QuicDownstreamSession) -> (u64, Vec<u8>, bool) {
             loop {
                 let event = timeout(TokioDuration::from_secs(2), session.recv_stream_event())
                     .await
@@ -2405,15 +2714,26 @@ mod tests {
         }
 
         let transport = TokioQuicheTransport::new();
-        let listener = Arc::new(
-            transport
-                .bind_listener(
-                    downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
-                        .with_tls_certificate(Some(downstream_listener_tls())),
-                )
-                .await
-                .unwrap(),
-        );
+        let listener = match transport
+            .bind_listener(
+                downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
+                    .with_tls_certificate(Some(downstream_listener_tls())),
+            )
+            .await
+        {
+            Ok(listener) => Arc::new(listener),
+            Err(error)
+                if error.etype() == &ErrorType::BindError
+                    && error.cause.as_ref().is_some_and(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    }) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind tokio-quiche listener: {error:?}"),
+        };
         let server_addr = listener.local_addr().unwrap();
         let listener_task = {
             let listener = Arc::clone(&listener);
@@ -2439,7 +2759,9 @@ mod tests {
             .await
             .unwrap();
         let upstream = connector.establish().await.unwrap();
-        upstream.send_stream_data(0, b"ping".to_vec(), true).unwrap();
+        upstream
+            .send_stream_data(0, b"ping".to_vec(), true)
+            .unwrap();
         let (stream_id, data, fin) = recv_upstream_until_data(&upstream).await;
 
         assert_eq!(stream_id, 0);
@@ -2456,13 +2778,26 @@ mod tests {
         use super::tokio_quiche_adapter::TokioQuicheTransport;
 
         let transport = TokioQuicheTransport::new();
-        let listener = transport
+        let listener = match transport
             .bind_listener(
                 downstream_listener_config(SocketAddr::Inet("127.0.0.1:0".parse().unwrap()))
                     .with_tls_certificate(Some(downstream_listener_tls())),
             )
             .await
-            .unwrap();
+        {
+            Ok(listener) => listener,
+            Err(error)
+                if error.etype() == &ErrorType::BindError
+                    && error.cause.as_ref().is_some_and(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|io| io.kind() == std::io::ErrorKind::PermissionDenied)
+                    }) =>
+            {
+                return;
+            }
+            Err(error) => panic!("failed to bind tokio-quiche listener: {error:?}"),
+        };
         let connector = transport
             .connect(
                 QuicConnectorConfig::new("origin-h3", listener.local_addr().unwrap())
