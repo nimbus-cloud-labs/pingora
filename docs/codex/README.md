@@ -15,3 +15,6 @@ This directory contains design and planning notes produced during repository ana
 - [QUIC Integration Strategy Design Note](quic-integration-strategy.md)
 - [UDP and HTTP/3 Validation Notes](udp-http3-validation.md)
 - [HTTP/3 Interoperability Matrix](http3-interop-matrix.md)
+- [HTTP/3 Production Readiness Review](http3-production-review.md)
+- [HTTP/3 Production Readiness Roadmap](http3-production-roadmap.md)
+- [HTTP/3 Production Readiness Task Breakdown](http3-production-tasks.md)
