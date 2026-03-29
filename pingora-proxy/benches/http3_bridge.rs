@@ -35,7 +35,7 @@ fn accepted_stream(event: QuicSessionEvent, flow_id: usize, stream_id: u64) -> H
 
     Http3AcceptedStream {
         transport: QuicIncomingDatagram {
-                session: QuicDownstreamSession {
+            session: QuicDownstreamSession {
                 flow_key: DatagramFlowKey {
                     listener_id: Arc::<str>::from("h3-bench"),
                     local_addr: local_addr.clone(),
@@ -48,11 +48,11 @@ fn accepted_stream(event: QuicSessionEvent, flow_id: usize, stream_id: u64) -> H
                     server_name: Some("example.com".to_string()),
                     resumed: false,
                 },
-                    established_at: Instant::now(),
-                    last_seen: Instant::now(),
-                    packets_received: 1,
-                    stream_handle: None,
-                },
+                established_at: Instant::now(),
+                last_seen: Instant::now(),
+                packets_received: 1,
+                stream_handle: None,
+            },
             datagram: Datagram::new(
                 DatagramMeta {
                     local_addr,

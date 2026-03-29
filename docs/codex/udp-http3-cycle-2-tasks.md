@@ -210,7 +210,7 @@ Provide just enough context for the assignee to pinpoint the code.
 
 ## Milestone 10
 
-### Task 10.1
+### [Implemented] Task 10.1
 
 Concise, user-visible summary of the fix
 
@@ -227,9 +227,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Current HTTP/3 bridge: `pingora-proxy/src/proxy_h3.rs`
-- Real QUIC stream lifecycle from Milestone 9
+- Real HTTP/3 request mapping implemented on `IncomingH3Headers`: `pingora-proxy/src/proxy_h3.rs`
 
-### Task 10.2
+### [Implemented] Task 10.2
 
 Concise, user-visible summary of the fix
 
@@ -246,9 +246,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Existing request body handling paths in `pingora-proxy`
-- HTTP/3 bridge foundation: `pingora-proxy/src/proxy_h3.rs`
+- Implemented request-body bridge via `Http3BodyReader`: `pingora-proxy/src/proxy_h3.rs`
 
-### Task 10.3
+### [Implemented] Task 10.3
 
 Concise, user-visible summary of the fix
 
@@ -265,9 +265,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Existing downstream response machinery in `pingora-proxy`
-- QUIC stream lifecycle types from Milestone 9
+- Implemented HTTP/3 response writeback via `Http3ResponseWriter`: `pingora-proxy/src/proxy_h3.rs`
 
-### Task 10.4
+### [Implemented] Task 10.4
 
 Concise, user-visible summary of the fix
 
@@ -284,9 +284,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Compatibility model: `pingora-proxy/src/proxy_h3.rs`
-- Phase docs: `docs/user_guide/phase.md`
+- Updated phase docs: `docs/user_guide/phase.md`
 
-### Task 10.5
+### [Implemented] Task 10.5
 
 Concise, user-visible summary of the fix
 
@@ -303,11 +303,11 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Negotiation model: `pingora-proxy/src/proxy_h3.rs`
-- HTTP/3 docs: `docs/user_guide/http3.md`
+- Downstream HTTP/3 tests and docs: `pingora-proxy/src/proxy_h3.rs` and `docs/user_guide/http3.md`
 
 ## Milestone 11
 
-### Task 11.1
+### [Implemented] Task 11.1
 
 Concise, user-visible summary of the fix
 
@@ -325,9 +325,9 @@ Provide just enough context for the assignee to pinpoint the code.
 
 - Upstream peer model: `pingora-core/src/upstreams/peer.rs`
 - Upstream selection hooks: `pingora-proxy/src/proxy_trait.rs`
-- HTTP/3 transport selection model: `pingora-proxy/src/proxy_h3.rs`
+- Implemented peer-to-connector mapping and transport selection: `pingora-proxy/src/proxy_h3.rs` and `pingora-quic/src/lib.rs`
 
-### Task 11.2
+### [Implemented] Task 11.2
 
 Concise, user-visible summary of the fix
 
@@ -344,9 +344,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - QUIC connector and pool: `pingora-quic/src/lib.rs`
-- Proxy HTTP/3 model: `pingora-proxy/src/proxy_h3.rs`
+- Implemented upstream HTTP/3 request executor: `pingora-proxy/src/proxy_h3.rs`
 
-### Task 11.3
+### [Implemented] Task 11.3
 
 Concise, user-visible summary of the fix
 
@@ -363,9 +363,9 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Retry classifier: `pingora-proxy/src/proxy_h3.rs`
-- Generic failover docs: `docs/user_guide/failover.md`
+- Real retry/fallback outcome wiring: `pingora-proxy/src/proxy_h3.rs`
 
-### Task 11.4
+### [Implemented] Task 11.4
 
 Concise, user-visible summary of the fix
 
@@ -381,10 +381,10 @@ Step-by-step, self-contained instructions for implementing the change.
 
 Provide just enough context for the assignee to pinpoint the code.
 
-- Current QUIC upstream pool: `pingora-quic/src/lib.rs`
+- Implemented HTTP/3 upstream pool: `pingora-quic/src/lib.rs`
 - Current upstream HTTP/3 docs: `docs/user_guide/http3.md`
 
-### Task 11.5
+### [Implemented] Task 11.5
 
 Concise, user-visible summary of the fix
 
@@ -401,7 +401,7 @@ Step-by-step, self-contained instructions for implementing the change.
 Provide just enough context for the assignee to pinpoint the code.
 
 - Validation note: `docs/codex/udp-http3-validation.md`
-- HTTP/3 guide: `docs/user_guide/http3.md`
+- Runtime executor tests and docs: `pingora-proxy/src/proxy_h3.rs` and `docs/user_guide/http3.md`
 
 ## Milestone 12
 

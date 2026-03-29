@@ -22,7 +22,9 @@ use pingora_core::server::Server;
 use pingora_core::upstreams::peer::HttpPeer;
 use pingora_core::Result;
 use pingora_http::ResponseHeader;
-use pingora_proxy::{Http3Negotiation, ProxyHttp, Session};
+#[cfg(feature = "http3")]
+use pingora_proxy::Http3Negotiation;
+use pingora_proxy::{ProxyHttp, Session};
 
 fn check_login(req: &pingora_http::RequestHeader) -> bool {
     // implement you logic check logic here
@@ -31,6 +33,7 @@ fn check_login(req: &pingora_http::RequestHeader) -> bool {
 
 pub struct MyGateway {
     req_metric: prometheus::IntCounter,
+    #[cfg(feature = "http3")]
     http3: Http3Negotiation,
 }
 
@@ -82,6 +85,7 @@ impl ProxyHttp for MyGateway {
         upstream_response
             .insert_header("Server", "MyGateway")
             .unwrap();
+        #[cfg(feature = "http3")]
         self.http3.apply_alt_svc(upstream_response)?;
 
         Ok(())
@@ -124,6 +128,7 @@ fn main() {
         &my_server.configuration,
         MyGateway {
             req_metric: register_int_counter!("req_counter", "Number of requests").unwrap(),
+            #[cfg(feature = "http3")]
             http3: Http3Negotiation::default(),
         },
     );
