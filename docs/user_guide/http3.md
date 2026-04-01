@@ -24,6 +24,7 @@ Treat the current surface like this:
 What exists today:
 
 - downstream HTTP/3 negotiation and `alt-svc` advertisement
+- downstream HTTP/3 listener support on the standard `http_proxy_service()` path
 - a QUIC transport boundary in `pingora-quic`
 - downstream HTTP/3 request, body, and response bridging into Pingora's request model
 - upstream HTTP/3 peer selection, pooled session execution, and retry classification
@@ -82,6 +83,26 @@ Current downstream compatibility is intentionally conservative:
 - downstream request trailers are not surfaced by the current backend and must be treated as unsupported
 - use `Http3CompatibilityReport` if you need an explicit view of supported phases
 
+To expose a real downstream HTTP/3 listener on the standard proxy service,
+configure the service with both the normal listener and an HTTP/3 listener:
+
+```rust
+use pingora::proxy::{http_proxy_service, Http3Negotiation};
+
+let mut proxy = http_proxy_service(&server.configuration, my_proxy);
+proxy.add_tls("0.0.0.0:6191", "server.crt", "server.key")?;
+proxy.add_http3("0.0.0.0:6191", "server.crt", "server.key")?;
+```
+
+This keeps HTTPS over TCP for HTTP/1.1 and HTTP/2 while enabling HTTP/3 on the
+same service entrypoint over UDP.
+
+The standard listener path has been validated locally for:
+
+- `GET` requests, including a live `HTTP/3 downstream -> HTTP/3 upstream`
+  round trip through the normal `http_proxy_service()` entrypoint
+- request-body-bearing local routes on the same standard listener path
+
 ## Upstream HTTP/3
 
 For upstream selection, Pingora exposes `Http3Peer` alongside the existing
@@ -122,7 +143,8 @@ The upstream transport choice is explicit via `HttpUpstreamTransport`.
 
 Current upstream HTTP/3 limits are still conservative:
 
-- request bodies are supported as buffered body chunks
+- request bodies are supported as buffered body chunks in the explicit upstream
+  executor path
 - response bodies are surfaced as buffered body chunks
 - upstream request trailers are not modeled yet
 - upstream response trailers are not surfaced by the current boundary and must be treated as unsupported
@@ -198,5 +220,6 @@ Today, the safe way to think about HTTP/3 support in Pingora is:
 
 - QUIC transport boundary: implemented
 - downstream negotiation and request bridge: implemented
+- downstream listener on the standard proxy service path: implemented
 - upstream HTTP/3 peer selection, pooled execution, and retry outcome wiring: implemented
 - fully integrated end-to-end HTTP/3 proxy path: still in progress

@@ -43,7 +43,7 @@ Relevant code and docs:
 - `pingora-proxy/examples/http3_proxy.rs`
 - `docs/codex/http3-interop-matrix.md`
 
-### Task 13.3: Validate upstream HTTP/3 against real origins
+### [Implemented] Task 13.3: Validate upstream HTTP/3 against real origins
 
 Summary: prove that Pingora can forward requests to real HTTP/3 origins without
 relying only on controlled fixtures.
@@ -63,7 +63,7 @@ Relevant code and docs:
 - `pingora-quic/src/lib.rs`
 - `docs/codex/http3-interop-matrix.md`
 
-### Task 13.4: Validate mixed-mode ingress and origin routing
+### [Implemented] Task 13.4: Validate mixed-mode ingress and origin routing
 
 Summary: verify the main deployment shape where Pingora terminates HTTP/3 and
 forwards to HTTP/1.1, HTTP/2, and HTTP/3 backends.
@@ -80,6 +80,37 @@ Relevant code and docs:
 - `pingora-proxy/src/proxy_trait.rs`
 - `pingora-proxy/src/proxy_h3.rs`
 - `docs/user_guide/http3.md`
+
+### [Implemented] Task 13.5: Expose downstream HTTP/3 on `http_proxy_service`
+
+Summary: make the standard Pingora proxy service able to terminate HTTP/3
+without relying on a custom harness or test-only bridge composition.
+
+Implementation steps:
+
+- add a downstream HTTP/3 listener path that can live alongside the existing
+  stream-based service model
+- wire accepted QUIC and HTTP/3 streams into the existing `HttpProxy` phase
+  lifecycle
+- keep the public API conservative by reusing the current proxy trait and
+  negotiation settings where possible
+- add at least one end-to-end example or integration test that uses the
+  standard service entrypoint
+
+Relevant code and docs:
+
+- `pingora-proxy/src/lib.rs`
+- `pingora-proxy/src/proxy_h3.rs`
+- `pingora-quic/src/lib.rs`
+- `pingora-core/src/services/listening.rs`
+
+Status note:
+
+- local validation now confirms the standard `http_proxy_service().add_http3(...)`
+  path works for downstream HTTP/3 `GET` requests, including live
+  `HTTP/3 downstream -> HTTP/3 upstream` round trips
+- local validation also confirms downstream HTTP/3 request bodies on the
+  standard listener path via the example-local `POST /echo` route
 
 ## Milestone 14: Failure-Mode Hardening
 

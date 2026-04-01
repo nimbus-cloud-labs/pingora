@@ -16,6 +16,7 @@ This directory contains design and planning notes produced during repository ana
 - [UDP and HTTP/3 Validation Notes](udp-http3-validation.md)
 - [HTTP/3 Interoperability Matrix](http3-interop-matrix.md)
 - [HTTP/3 Downstream Validation Playbook](http3-downstream-validation-playbook.md)
+- [HTTP/3 Upstream Validation Playbook](http3-upstream-validation-playbook.md)
 - [HTTP/3 Production Readiness Review](http3-production-review.md)
 - [HTTP/3 Production Readiness Roadmap](http3-production-roadmap.md)
 - [HTTP/3 Production Readiness Task Breakdown](http3-production-tasks.md)

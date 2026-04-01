@@ -30,11 +30,23 @@ mod example {
     use pingora_proxy::{
         Http3Negotiation, Http3RetryClassifier, Http3RetryPolicy, ProxyHttp, Session,
     };
+    use std::env;
     use std::time::Duration;
 
     pub struct Http3AwareProxy {
         downstream_http3: Http3Negotiation,
         upstream_retry: Http3RetryClassifier,
+    }
+
+    fn upstream_host() -> String {
+        env::var("PINGORA_HTTP3_UPSTREAM_HOST").unwrap_or_else(|_| "www.google.com".to_string())
+    }
+
+    fn upstream_port() -> u16 {
+        env::var("PINGORA_HTTP3_UPSTREAM_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(443)
     }
 
     #[async_trait]
@@ -56,6 +68,17 @@ mod example {
                 return Ok(true);
             }
 
+            if session.req_header().uri.path() == "/echo" {
+                let mut body = Vec::new();
+                while let Some(chunk) = session.as_downstream_mut().read_request_body().await? {
+                    body.extend_from_slice(&chunk);
+                }
+                session
+                    .respond_error_with_body(200, Bytes::from(body))
+                    .await?;
+                return Ok(true);
+            }
+
             Ok(false)
         }
 
@@ -64,10 +87,12 @@ mod example {
             _session: &mut Session,
             _ctx: &mut Self::CTX,
         ) -> Result<Box<HttpPeer>> {
+            let host = upstream_host();
+            let port = upstream_port();
             Ok(Box::new(HttpPeer::new(
-                ("127.0.0.1", 8080),
-                false,
-                "localhost".to_string(),
+                (host.as_str(), port),
+                true,
+                host.clone(),
             )))
         }
 
@@ -84,11 +109,13 @@ mod example {
             _session: &mut Session,
             _ctx: &mut Self::CTX,
         ) -> Result<Option<Box<Http3Peer>>> {
-            let mut peer = Http3Peer::new(("127.0.0.1", 8443), "localhost".to_string());
+            let host = upstream_host();
+            let port = upstream_port();
+            let mut peer = Http3Peer::new((host.as_str(), port), host.clone());
             peer.options = peer
                 .options
                 .clone()
-                .with_connect_timeout(Some(Duration::from_secs(2)))
+                .with_connect_timeout(Some(Duration::from_secs(5)))
                 .with_idle_timeout(Some(Duration::from_secs(30)));
             Ok(Some(Box::new(peer)))
         }
@@ -122,7 +149,12 @@ mod example {
     }
 
     // RUST_LOG=INFO cargo run -p pingora-proxy --example http3_proxy --features http3
-    // curl 127.0.0.1:6191/about
+    // curl -k https://127.0.0.1:6191/about
+    // curl -k https://127.0.0.1:6191/robots.txt -H "Host: www.google.com"
+    // curl --http3-only -k https://127.0.0.1:6191/robots.txt -H "Host: www.google.com"
+    // curl --http3-only -k https://127.0.0.1:6191/echo -d 'pingora-http3'
+    // PINGORA_HTTP3_UPSTREAM_HOST=www.google.com PINGORA_HTTP3_UPSTREAM_PORT=443 \
+    //   cargo run -p pingora-proxy --example http3_proxy --features http3
     pub fn run() {
         env_logger::init();
 
@@ -135,7 +167,7 @@ mod example {
             Http3AwareProxy {
                 downstream_http3: Http3Negotiation {
                     enabled: true,
-                    advertised_port: 443,
+                    advertised_port: 6191,
                     max_age: Some(86_400),
                 },
                 upstream_retry: Http3RetryClassifier::new(Http3RetryPolicy {
@@ -144,7 +176,20 @@ mod example {
                 }),
             },
         );
-        proxy.add_tcp("0.0.0.0:6191");
+        let cert_path = format!(
+            "{}/../pingora-core/tests/certs/server.crt",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let key_path = format!(
+            "{}/../pingora-core/tests/certs/server.key",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        proxy
+            .add_tls("0.0.0.0:6191", &cert_path, &key_path)
+            .expect("valid TLS listener");
+        proxy
+            .add_http3("0.0.0.0:6191", &cert_path, &key_path)
+            .expect("valid HTTP/3 listener");
         server.add_service(proxy);
         server.run_forever();
     }

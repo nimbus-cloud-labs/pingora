@@ -25,11 +25,18 @@ Focus areas:
 - upstream HTTP/3 against real origins
 - mixed deployments where Pingora terminates HTTP/3 and forwards to HTTP/1.1 or
   HTTP/2 upstreams
+- exposing a real downstream HTTP/3 listener through the standard proxy service
+  model
 - protocol negotiation behavior, including `alt-svc` and fallback boundaries
 
 Success criteria:
 
 - a documented interop matrix has been executed
+- the standard `http_proxy_service()` path can be configured for downstream
+  HTTP/3 without a custom harness
+- the standard `http_proxy_service()` path is validated locally for
+  downstream HTTP/3 `GET` and request-body-bearing local routes on the real
+  listener
 - failures are classified as bug, unsupported behavior, or environment issue
 - unstable cases are either fixed or documented as unsupported
 
