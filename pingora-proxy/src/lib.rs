@@ -61,6 +61,10 @@ use pingora_core::apps::{
 };
 use pingora_core::connectors::http::custom;
 use pingora_core::connectors::{http::Connector, ConnectorOptions};
+use pingora_core::listeners::tls::TlsSettings;
+#[cfg(feature = "connection_filter")]
+use pingora_core::listeners::AcceptAllFilter;
+use pingora_core::listeners::{ConnectionFilter, Listeners, ServerAddress, TcpSocketOptions};
 use pingora_core::modules::http::compression::ResponseCompressionBuilder;
 use pingora_core::modules::http::{HttpModuleCtx, HttpModules};
 use pingora_core::protocols::http::client::HttpSession as ClientSession;
@@ -74,9 +78,17 @@ use pingora_core::protocols::http::SERVER_NAME;
 use pingora_core::protocols::Stream;
 use pingora_core::protocols::{Digest, UniqueID};
 use pingora_core::server::configuration::ServerConf;
+#[cfg(unix)]
+use pingora_core::server::ListenFds;
 use pingora_core::server::{RuntimeOpts, ShutdownWatch};
+use pingora_core::services::listening::RuntimeOptsOverride;
+use pingora_core::services::Service as ServiceTrait;
 use pingora_core::upstreams::peer::{HttpPeer, Peer};
 use pingora_error::{Error, ErrorSource, ErrorType::*, OrErr, Result};
+#[cfg(feature = "http3")]
+use pingora_quic::{QuicCertificateKind, QuicListenerConfig, QuicTlsCertificate};
+use std::fs::Permissions;
+use std::mem;
 
 const TASK_BUFFER_SIZE: usize = 4;
 
@@ -191,6 +203,37 @@ impl ShardedNotify {
     }
 }
 
+/// The standard service wrapper for [`HttpProxy`].
+///
+/// This service owns the proxy application and the configured downstream
+/// listeners. It supports the existing TCP or TLS downstream paths and, when
+/// the `http3` feature is enabled, can also host QUIC or HTTP/3 listeners.
+pub struct HttpProxyService<SV, C = ()>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    name: String,
+    listeners: Listeners,
+    app_logic: Option<HttpProxy<SV, C>>,
+    pub threads: Option<usize>,
+    runtime_opts_override: Option<RuntimeOptsOverride>,
+    #[cfg(feature = "http3")]
+    http3_listeners: Vec<QuicListenerConfig>,
+    #[cfg(feature = "connection_filter")]
+    connection_filter: Arc<dyn ConnectionFilter>,
+}
+
+struct SharedHttpProxy<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    inner: Arc<HttpProxy<SV, C>>,
+}
+
 /// The concrete type that holds the user defined HTTP proxy.
 ///
 /// Users don't need to interact with this object directly.
@@ -209,6 +252,8 @@ where
     pub upstream_modules: HttpModules,
     max_retries: usize,
     process_custom_session: Option<ProcessCustomSession<SV, C>>,
+    #[cfg(feature = "http3")]
+    http3_upstream: Http3UpstreamExecutor,
 }
 
 impl<SV> HttpProxy<SV, ()> {
@@ -245,6 +290,8 @@ impl<SV> HttpProxy<SV, ()> {
             upstream_modules: HttpModules::new(),
             max_retries: conf.max_retries,
             process_custom_session: None,
+            #[cfg(feature = "http3")]
+            http3_upstream: Http3UpstreamExecutor::new(),
         }
     }
 }
@@ -281,6 +328,8 @@ where
             max_retries: conf.max_retries,
             process_custom_session: on_custom,
             h2_options: None,
+            #[cfg(feature = "http3")]
+            http3_upstream: Http3UpstreamExecutor::new(),
         }
     }
 
@@ -428,6 +477,31 @@ where
             Err(e) => return (false, Some(e)),
         };
 
+        #[cfg(feature = "http3")]
+        {
+            let transport = match self.inner.upstream_transport(session, ctx).await {
+                Ok(transport) => transport,
+                Err(e) => return (false, Some(e)),
+            };
+            let http3_peer = match self.inner.upstream_http3_peer(session, ctx).await {
+                Ok(peer) => peer,
+                Err(e) => return (false, Some(e)),
+            };
+            let selected =
+                match self
+                    .http3_upstream
+                    .select_upstream(transport, peer.clone(), http3_peer)
+                {
+                    Ok(selected) => selected,
+                    Err(e) => return (false, Some(e)),
+                };
+            if let SelectedHttpUpstream::Http3(http3_peer) = selected {
+                return self
+                    .proxy_to_h3_upstream(session, &peer, &http3_peer, ctx)
+                    .await;
+            }
+        }
+
         let client_session = self.client_upstream.get_http_session(&*peer).await;
         match client_session {
             Ok((client_session, client_reused)) => {
@@ -500,6 +574,166 @@ where
         }
     }
 
+    #[cfg(feature = "http3")]
+    async fn proxy_to_h3_upstream(
+        &self,
+        session: &mut Session,
+        stream_peer: &HttpPeer,
+        http3_peer: &pingora_core::upstreams::peer::Http3Peer,
+        ctx: &mut SV::CTX,
+    ) -> (bool, Option<Box<Error>>)
+    where
+        SV: ProxyHttp + Send + Sync,
+        SV::CTX: Send + Sync,
+    {
+        let mut request_header = session.req_header().clone();
+        if let Err(error) = self
+            .inner
+            .upstream_request_filter(session, &mut request_header, ctx)
+            .await
+        {
+            return (false, Some(error));
+        }
+
+        let mut body = Vec::new();
+        let mut body_len = 0usize;
+        loop {
+            let read = match session.as_mut().read_request_body().await {
+                Ok(read) => read,
+                Err(error) => return (false, Some(error.into_down())),
+            };
+            let end_of_body = read.is_none();
+            let mut data = read;
+
+            if let Err(error) = session
+                .downstream_modules_ctx
+                .request_body_filter(&mut data, end_of_body)
+                .await
+            {
+                return (false, Some(error));
+            }
+            if let Err(error) = self
+                .inner
+                .request_body_filter(session, &mut data, end_of_body, ctx)
+                .await
+            {
+                return (false, Some(error));
+            }
+
+            let upstream_end_of_body = end_of_body || data.is_none();
+            if !upstream_end_of_body && data.as_ref().is_some_and(|d| d.is_empty()) {
+                continue;
+            }
+
+            let data = data.unwrap_or_default();
+            body_len += data.len();
+            body.push(Http3UpstreamBodyChunk {
+                data: data.to_vec(),
+                fin: upstream_end_of_body,
+            });
+
+            if upstream_end_of_body {
+                break;
+            }
+        }
+
+        request_header.remove_header(&header::TRANSFER_ENCODING);
+        if body.is_empty() {
+            request_header
+                .insert_header(header::CONTENT_LENGTH, "0")
+                .ok();
+        } else {
+            request_header
+                .insert_header(header::CONTENT_LENGTH, body_len.to_string())
+                .ok();
+        }
+
+        let request = Http3UpstreamRequest::new(request_header).with_body(body);
+        let classifier = Http3RetryClassifier::default();
+        let outcome = match self
+            .http3_upstream
+            .execute(http3_peer, request, &classifier)
+            .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => return (false, Some(error.into_up())),
+        };
+
+        match outcome {
+            Http3UpstreamOutcome::Response(response) => {
+                let mut response_header = response.response_header;
+                response_header.version = session.req_header().version;
+                if let Err(error) = self
+                    .inner
+                    .upstream_response_filter(session, &mut response_header, ctx)
+                    .await
+                {
+                    return (false, Some(error));
+                }
+                if let Err(error) = self
+                    .inner
+                    .response_filter(session, &mut response_header, ctx)
+                    .await
+                {
+                    return (false, Some(error));
+                }
+
+                let end_of_stream = response.body.is_empty();
+                if let Err(error) = session
+                    .write_response_header(Box::new(response_header), end_of_stream)
+                    .await
+                {
+                    return (false, Some(error.into_down()));
+                }
+                let mut body_bytes_received = 0usize;
+                for chunk in response.body {
+                    let mut data = if chunk.data.is_empty() {
+                        None
+                    } else {
+                        Some(Bytes::from(chunk.data))
+                    };
+                    body_bytes_received += data.as_ref().map_or(0, Bytes::len);
+                    if let Err(error) = self
+                        .inner
+                        .upstream_response_body_filter(session, &mut data, chunk.fin, ctx)
+                    {
+                        return (false, Some(error));
+                    }
+                    if let Err(error) = session.write_response_body(data, chunk.fin).await {
+                        return (false, Some(error.into_down()));
+                    }
+                }
+
+                session.set_upstream_body_bytes_received(body_bytes_received);
+                (false, None)
+            }
+            Http3UpstreamOutcome::Retry(decision) => {
+                let mut error = Error::explain(
+                    match decision.action {
+                        Http3RetryAction::Fail => ConnectionClosed,
+                        Http3RetryAction::RetrySamePeer | Http3RetryAction::RetryNextPeer => {
+                            ConnectError
+                        }
+                        Http3RetryAction::Fallback(_) => ConnectTimedout,
+                    },
+                    format!(
+                        "HTTP/3 upstream decision {:?} for peer {}",
+                        decision.action, http3_peer
+                    ),
+                )
+                .into_up();
+                error.set_retry(decision.mark_retryable);
+                (
+                    false,
+                    Some(
+                        self.inner
+                            .error_while_proxy(stream_peer, session, error, ctx, false),
+                    ),
+                )
+            }
+        }
+    }
+
     async fn upstream_filter(
         &self,
         session: &mut Session,
@@ -551,6 +785,11 @@ where
 
         if let Some(e) = error {
             session.downstream_session.on_proxy_failure(e);
+        }
+
+        if session.downstream_session.is_subrequest() {
+            let _ = session.downstream_session.finish().await;
+            return None;
         }
 
         if reuse {
@@ -1642,7 +1881,383 @@ where
     // TODO implement h2_options
 }
 
-use pingora_core::services::listening::{RuntimeOptsOverride, Service};
+#[async_trait]
+impl<SV, C> HttpServerApp for SharedHttpProxy<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    async fn process_new_http(
+        self: &Arc<Self>,
+        session: HttpSession,
+        shutdown: &ShutdownWatch,
+    ) -> Option<ReusedHttpStream> {
+        self.inner.process_new_http(session, shutdown).await
+    }
+
+    async fn http_cleanup(&self) {
+        self.inner.http_cleanup().await;
+    }
+
+    fn server_options(&self) -> Option<&HttpServerOptions> {
+        self.inner.server_options()
+    }
+
+    fn h2_options(&self) -> Option<H2Options> {
+        self.inner.h2_options()
+    }
+
+    async fn process_custom_session(
+        self: Arc<Self>,
+        stream: Stream,
+        shutdown: &ShutdownWatch,
+    ) -> Option<Stream> {
+        self.inner
+            .clone()
+            .process_custom_session(stream, shutdown)
+            .await
+    }
+}
+
+impl<SV> HttpProxyService<SV, ()>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+{
+    fn new(name: String, app_logic: HttpProxy<SV, ()>) -> Self {
+        Self {
+            name,
+            listeners: Listeners::new(),
+            app_logic: Some(app_logic),
+            threads: None,
+            runtime_opts_override: None,
+            #[cfg(feature = "http3")]
+            http3_listeners: Vec::new(),
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
+        }
+    }
+}
+
+impl<SV, C> HttpProxyService<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    fn new_custom(name: String, app_logic: HttpProxy<SV, C>) -> Self {
+        Self {
+            name,
+            listeners: Listeners::new(),
+            app_logic: Some(app_logic),
+            threads: None,
+            runtime_opts_override: None,
+            #[cfg(feature = "http3")]
+            http3_listeners: Vec::new(),
+            #[cfg(feature = "connection_filter")]
+            connection_filter: Arc::new(AcceptAllFilter),
+        }
+    }
+
+    pub fn endpoints(&mut self) -> &mut Listeners {
+        &mut self.listeners
+    }
+
+    pub fn app_logic(&self) -> Option<&HttpProxy<SV, C>> {
+        self.app_logic.as_ref()
+    }
+
+    pub fn app_logic_mut(&mut self) -> Option<&mut HttpProxy<SV, C>> {
+        self.app_logic.as_mut()
+    }
+
+    /// Set a runtime options override for the TCP and TLS listener service.
+    ///
+    /// Returning [`None`] from the override uses the global runtime options.
+    pub fn set_runtime_opts_override(&mut self, override_fn: RuntimeOptsOverride) {
+        self.runtime_opts_override = Some(override_fn);
+    }
+
+    pub fn add_tcp(&mut self, addr: &str) {
+        self.listeners.add_tcp(addr);
+    }
+
+    pub fn add_tcp_with_settings(&mut self, addr: &str, sock_opt: TcpSocketOptions) {
+        self.listeners.add_tcp_with_settings(addr, sock_opt);
+    }
+
+    #[cfg(unix)]
+    pub fn add_uds(&mut self, addr: &str, perm: Option<Permissions>) {
+        self.listeners.add_uds(addr, perm);
+    }
+
+    pub fn add_tls(&mut self, addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
+        self.listeners.add_tls(addr, cert_path, key_path)
+    }
+
+    pub fn add_tls_with_settings(
+        &mut self,
+        addr: &str,
+        sock_opt: Option<TcpSocketOptions>,
+        settings: TlsSettings,
+    ) {
+        self.listeners
+            .add_tls_with_settings(addr, sock_opt, settings)
+    }
+
+    pub fn add_address(&mut self, addr: ServerAddress) {
+        self.listeners.add_address(addr);
+    }
+
+    #[cfg(feature = "connection_filter")]
+    pub fn set_connection_filter(&mut self, filter: Arc<dyn ConnectionFilter>) {
+        self.connection_filter = filter.clone();
+        self.listeners.set_connection_filter(filter);
+    }
+
+    #[cfg(not(feature = "connection_filter"))]
+    pub fn set_connection_filter(&mut self, _filter: Arc<dyn ConnectionFilter>) {}
+
+    #[cfg(feature = "http3")]
+    pub fn add_http3(&mut self, addr: &str, cert_path: &str, key_path: &str) -> Result<()> {
+        let addr: std::net::SocketAddr = addr
+            .parse()
+            .or_err(BindError, "invalid HTTP/3 listen address")?;
+        let config = QuicListenerConfig::new(
+            format!("{}/h3", self.name),
+            pingora_core::protocols::l4::socket::SocketAddr::Inet(addr),
+        )
+        .with_alpn_protocols(vec![b"h3".to_vec()])
+        .with_tls_certificate(Some(QuicTlsCertificate::new(
+            cert_path,
+            key_path,
+            QuicCertificateKind::X509,
+        )));
+        config.validate()?;
+        self.http3_listeners.push(config);
+        Ok(())
+    }
+
+    #[cfg(feature = "http3")]
+    pub fn add_http3_with_settings(&mut self, config: QuicListenerConfig) -> Result<()> {
+        config.validate()?;
+        self.http3_listeners.push(config);
+        Ok(())
+    }
+
+    #[cfg(feature = "http3")]
+    async fn run_http3_endpoint(
+        app_logic: Arc<HttpProxy<SV, C>>,
+        config: QuicListenerConfig,
+        shutdown: ShutdownWatch,
+    ) {
+        use futures::StreamExt;
+        use pingora_core::protocols::l4::datagram::DatagramMeta;
+        use pingora_core::protocols::l4::socket::SocketAddr as L4SocketAddr;
+        use pingora_quic::QuicConnectionMeta;
+        use std::time::Instant;
+        use tokio_quiche::http3::driver::{H3Event, ServerH3Event};
+        use tokio_quiche::http3::settings::Http3Settings;
+        use tokio_quiche::metrics::DefaultMetrics;
+        use tokio_quiche::settings::{ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths};
+
+        let local_addr = *config
+            .listen_addr
+            .as_inet()
+            .expect("validated inet socket address for HTTP/3 listener");
+        let socket = match tokio::net::UdpSocket::bind(local_addr).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                error!(
+                    "binding downstream HTTP/3 listener {} failed: {}",
+                    config.name, error
+                );
+                return;
+            }
+        };
+        let tls = config
+            .tls_certificate
+            .as_ref()
+            .expect("validated HTTP/3 listener TLS settings");
+        let mut settings = QuicSettings::default();
+        settings.alpn = config.alpn_protocols.clone();
+        settings.max_idle_timeout = Some(config.max_idle_timeout);
+        settings.initial_max_streams_bidi = config.max_concurrent_bidi_streams;
+        settings.max_recv_udp_payload_size = config.max_datagram_size;
+        settings.max_send_udp_payload_size = config.max_datagram_size;
+        let params = ConnectionParams::new_server(
+            settings,
+            TlsCertificatePaths {
+                cert: &tls.cert_path,
+                private_key: &tls.private_key_path,
+                kind: match tls.kind {
+                    QuicCertificateKind::X509 => tokio_quiche::settings::CertificateKind::X509,
+                    QuicCertificateKind::RawPublicKey => {
+                        tokio_quiche::settings::CertificateKind::RawPublicKey
+                    }
+                },
+            },
+            Hooks::default(),
+        );
+        let mut listeners = match tokio_quiche::listen([socket], params, DefaultMetrics) {
+            Ok(listeners) => listeners,
+            Err(error) => {
+                error!(
+                    "starting downstream HTTP/3 listener {} failed: {}",
+                    config.name, error
+                );
+                return;
+            }
+        };
+        let accept_stream = &mut listeners[0];
+
+        loop {
+            let next = tokio::select! {
+                next = accept_stream.next() => next,
+                shutdown_signal = async {
+                    let mut shutdown = shutdown.clone();
+                    shutdown.changed().await
+                } => {
+                    match shutdown_signal {
+                        Ok(()) if *shutdown.borrow() => break,
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+            };
+
+            let Some(connection_result) = next else {
+                break;
+            };
+            let app = app_logic.clone();
+            let listener_name = config.name.clone();
+            let shutdown = shutdown.clone();
+            tokio::spawn(async move {
+                let Ok(connection) = connection_result else {
+                    return;
+                };
+                let local_addr = L4SocketAddr::Inet(connection.local_addr());
+                let peer_addr = L4SocketAddr::Inet(connection.peer_addr());
+                let session = pingora_quic::QuicDownstreamSession {
+                    flow_key: DatagramMeta {
+                        local_addr: local_addr.clone(),
+                        peer_addr: peer_addr.clone(),
+                    }
+                    .flow_key(listener_name),
+                    meta: QuicConnectionMeta {
+                        local_addr,
+                        peer_addr,
+                        alpn_protocol: Some(b"h3".to_vec()),
+                        server_name: None,
+                        resumed: false,
+                    },
+                    established_at: Instant::now(),
+                    last_seen: Instant::now(),
+                    packets_received: 0,
+                    stream_handle: None,
+                };
+                let bridge = crate::Http3ProxyBridge::new();
+                let (driver, mut controller) =
+                    tokio_quiche::ServerH3Driver::new(Http3Settings::default());
+                connection.start(driver);
+                while let Some(event) = controller.event_receiver_mut().recv().await {
+                    match event {
+                        ServerH3Event::Headers {
+                            incoming_headers, ..
+                        } => {
+                            let request = match bridge
+                                .accept_incoming_headers(session.clone(), incoming_headers)
+                            {
+                                Ok(request) => request,
+                                Err(error) => {
+                                    error!("failed to map downstream HTTP/3 request: {error}");
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = crate::proxy_h3::proxy_downstream_http3_request(
+                                app.clone(),
+                                request,
+                                &shutdown,
+                            )
+                            .await
+                            {
+                                error!("failed to proxy downstream HTTP/3 request: {error}");
+                            }
+                        }
+                        ServerH3Event::Core(H3Event::ConnectionShutdown(_)) => break,
+                        _ => {}
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[async_trait]
+impl<SV, C> ServiceTrait for HttpProxyService<SV, C>
+where
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
+    C: custom::Connector,
+{
+    async fn start_service(
+        &mut self,
+        #[cfg(unix)] fds: Option<ListenFds>,
+        shutdown: ShutdownWatch,
+        listeners_per_fd: usize,
+    ) {
+        let app_logic = Arc::new(
+            self.app_logic
+                .take()
+                .expect("can only start_service() once"),
+        );
+        let mut handlers = Vec::new();
+        let listeners = mem::replace(&mut self.listeners, Listeners::new());
+        let mut stream_service = pingora_core::services::listening::Service::with_listeners(
+            self.name.clone(),
+            listeners,
+            SharedHttpProxy {
+                inner: app_logic.clone(),
+            },
+        );
+        stream_service.threads = self.threads;
+        if let Some(runtime_opts_override) = self.runtime_opts_override.clone() {
+            stream_service.set_runtime_opts_override(runtime_opts_override);
+        }
+        let stream_shutdown = shutdown.clone();
+        handlers.push(tokio::spawn(async move {
+            ServiceTrait::start_service(
+                &mut stream_service,
+                #[cfg(unix)]
+                fds,
+                stream_shutdown,
+                listeners_per_fd,
+            )
+            .await;
+        }));
+
+        #[cfg(feature = "http3")]
+        for listener in self.http3_listeners.clone() {
+            let app_logic = app_logic.clone();
+            let shutdown = shutdown.clone();
+            handlers.push(tokio::spawn(async move {
+                Self::run_http3_endpoint(app_logic, listener, shutdown).await;
+            }));
+        }
+
+        futures::future::join_all(handlers).await;
+        app_logic.http_cleanup().await;
+    }
+
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn threads(&self) -> Option<usize> {
+        self.threads
+    }
+}
 
 /// Create an [`HttpProxy`] without wrapping it in a [`Service`].
 ///
@@ -1683,42 +2298,44 @@ where
     proxy
 }
 
-/// Create a [Service] from the user implemented [ProxyHttp].
+/// Create an [`HttpProxyService`] from the user implemented [ProxyHttp].
 ///
-/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
-pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> Service<HttpProxy<SV, ()>>
+/// The returned service can be hosted by a [pingora_core::server::Server] directly.
+pub fn http_proxy_service<SV>(conf: &Arc<ServerConf>, inner: SV) -> HttpProxyService<SV, ()>
 where
-    SV: ProxyHttp,
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
 {
     http_proxy_service_with_name(conf, inner, "Pingora HTTP Proxy Service")
 }
 
-/// Create a [Service] from the user implemented [ProxyHttp].
+/// Create an [`HttpProxyService`] from the user implemented [ProxyHttp].
 ///
-/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+/// The returned service can be hosted by a [pingora_core::server::Server] directly.
 pub fn http_proxy_service_with_name<SV>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
-) -> Service<HttpProxy<SV, ()>>
+) -> HttpProxyService<SV, ()>
 where
-    SV: ProxyHttp,
+    SV: ProxyHttp + Send + Sync + 'static,
+    SV::CTX: Send + Sync + 'static,
 {
     let mut proxy = HttpProxy::new(inner, conf.clone());
     proxy.handle_init_modules();
-    Service::new(name.to_string(), proxy)
+    HttpProxyService::new(name.to_string(), proxy)
 }
 
-/// Create a [Service] from the user implemented [ProxyHttp].
+/// Create an [`HttpProxyService`] from the user implemented [ProxyHttp].
 ///
-/// The returned [Service] can be hosted by a [pingora_core::server::Server] directly.
+/// The returned service can be hosted by a [pingora_core::server::Server] directly.
 pub fn http_proxy_service_with_name_custom<SV, C>(
     conf: &Arc<ServerConf>,
     inner: SV,
     name: &str,
     connector: C,
     on_custom: ProcessCustomSession<SV, C>,
-) -> Service<HttpProxy<SV, C>>
+) -> HttpProxyService<SV, C>
 where
     SV: ProxyHttp + Send + Sync + 'static,
     SV::CTX: Send + Sync + 'static,
@@ -1728,10 +2345,10 @@ where
         HttpProxy::new_custom(inner, conf.clone(), connector, Some(on_custom), None, None);
     proxy.handle_init_modules();
 
-    Service::new(name.to_string(), proxy)
+    HttpProxyService::new_custom(name.to_string(), proxy)
 }
 
-/// A builder for a [Service] that can be used to create a [HttpProxy] instance
+/// A builder for an [`HttpProxyService`] that can be used to create a [HttpProxy] instance
 ///
 /// The [ProxyServiceBuilder] can be used to construct a [HttpProxy] service with a custom name,
 /// connector, and custom session handler.
@@ -1842,7 +2459,7 @@ where
         self
     }
 
-    /// Set a runtime options override for the [Service] built by this builder.
+    /// Set a runtime options override for the [`HttpProxyService`] built by this builder.
     ///
     /// Returning [`None`] from the override uses the global runtime options.
     pub fn runtime_opts_override<F>(mut self, override_fn: F) -> Self
@@ -1853,13 +2470,13 @@ where
         self
     }
 
-    /// Builds a new [Service] from the [ProxyServiceBuilder].
+    /// Builds a new [`HttpProxyService`] from the [ProxyServiceBuilder].
     ///
-    /// This function takes ownership of the [ProxyServiceBuilder] and returns a new [Service] with
+    /// This function takes ownership of the [ProxyServiceBuilder] and returns a new service with
     /// a fully initialized [HttpProxy].
     ///
-    /// The returned [Service] is ready to be used by a [pingora_core::server::Server].
-    pub fn build(self) -> Service<HttpProxy<SV, C>> {
+    /// The returned service is ready to be used by a [pingora_core::server::Server].
+    pub fn build(self) -> HttpProxyService<SV, C> {
         let Self {
             conf,
             inner,
@@ -1881,10 +2498,8 @@ where
         );
 
         proxy.handle_init_modules();
-        let mut service = Service::new(name, proxy);
-        if let Some(runtime_opts_override) = runtime_opts_override {
-            service.set_runtime_opts_override(runtime_opts_override);
-        }
+        let mut service = HttpProxyService::new_custom(name, proxy);
+        service.runtime_opts_override = runtime_opts_override;
         service
     }
 }

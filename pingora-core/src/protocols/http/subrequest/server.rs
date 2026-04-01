@@ -34,7 +34,7 @@
 
 use bytes::Bytes;
 use http::HeaderValue;
-use http::{header, header::AsHeaderName, HeaderMap, Method};
+use http::{header, header::AsHeaderName, HeaderMap, Method, Version};
 use log::{debug, trace, warn};
 use pingora_error::{Error, ErrorType::*, OkOrErr, OrErr, Result};
 use pingora_http::{RequestHeader, ResponseHeader};
@@ -48,6 +48,7 @@ use crate::protocols::http::{
     body_buffer::FixedBuffer,
     server::Session as GenericHttpSession,
     subrequest::dummy::DummyIO,
+    v1::client::http_req_header_to_wire,
     v1::common::{header_value_content_length, is_chunked_encoding_from_headers, BODY_BUF_LIMIT},
     v1::server::HttpSession as SessionV1,
     HttpTask,
@@ -123,6 +124,7 @@ pub struct HttpSession {
     proxy_tasks_enabled: bool,
     /// Cancel-safe proxy task state.
     proxy_task_state: ProxyTaskState,
+    request_version_override: Option<Version>,
 }
 
 /// A handle to the subrequest session itself to interact or read from it.
@@ -182,6 +184,53 @@ impl HttpSession {
                 digest: digest.map(Box::new),
                 proxy_tasks_enabled: false,
                 proxy_task_state: ProxyTaskState::default(),
+                request_version_override: None,
+            },
+            SubrequestHandle {
+                tx: downstream_tx,
+                rx: upstream_rx,
+                subreq_wants_body: wants_body_rx,
+                subreq_proxy_error: proxy_error_rx,
+            },
+        )
+    }
+
+    /// Create a new subrequest session from a prepared request header.
+    pub fn new_from_request_header(mut request: RequestHeader) -> (Self, SubrequestHandle) {
+        let request_version = request.version;
+        request.version = Version::HTTP_11;
+        let raw = http_req_header_to_wire(&request)
+            .expect("request header must be serializable as HTTP/1.1 for subrequest setup");
+        let v1_inner = SessionV1::new(Box::new(DummyIO::new(raw.as_ref())));
+
+        const CHANNEL_BUFFER_SIZE: usize = 4;
+        let (downstream_tx, downstream_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let (upstream_tx, upstream_rx) = mpsc::channel(CHANNEL_BUFFER_SIZE);
+        let (wants_body_tx, wants_body_rx) = oneshot::channel();
+        let (proxy_error_tx, proxy_error_rx) = oneshot::channel();
+
+        (
+            HttpSession {
+                v1_inner: Box::new(v1_inner),
+                tx: Some(upstream_tx),
+                rx: Some(downstream_rx),
+                proxy_error: Some(proxy_error_tx),
+                body_reader: BodyReader::new(Some(wants_body_tx)),
+                body_writer: BodyWriter::new(),
+                read_req_header: false,
+                response_written: None,
+                read_timeout: None,
+                write_timeout: None,
+                total_drain_timeout: None,
+                body_bytes_sent: 0,
+                body_bytes_read: 0,
+                retry_buffer: None,
+                upgraded: false,
+                clear_request_body_headers: false,
+                digest: None,
+                proxy_tasks_enabled: false,
+                proxy_task_state: ProxyTaskState::default(),
+                request_version_override: Some(request_version),
             },
             SubrequestHandle {
                 tx: downstream_tx,
@@ -201,6 +250,9 @@ impl HttpSession {
             return Error::e_explain(InternalError, "no session request header provided");
         }
         self.read_req_header = true;
+        if let Some(version) = self.request_version_override.take() {
+            self.v1_inner.req_header_mut().version = version;
+        }
         if self.clear_request_body_headers {
             // indicated that we wanted to clear these headers in the past, do so now
             self.clear_request_body_headers();
@@ -1247,6 +1299,7 @@ mod tests_stream {
     use super::*;
     use crate::protocols::http::subrequest::body::{BodyMode, ParseState};
     use bytes::BufMut;
+    use http::header::HOST;
     use http::StatusCode;
     use rstest::rstest;
 
@@ -1298,6 +1351,35 @@ mod tests_stream {
     pub(super) async fn build_head_req() -> (HttpSession, SubrequestHandle) {
         let input = "HEAD / HTTP/1.1\r\nHost: pingora.org\r\n\r\n".to_string();
         session_from_input(input.as_bytes()).await
+    }
+
+    #[tokio::test]
+    async fn read_h3_header_from_prepared_request() {
+        init_log();
+        let mut request = RequestHeader::build("POST", b"/submit", Some(2)).unwrap();
+        request.version = Version::HTTP_3;
+        request.insert_header(HOST, "example.com").unwrap();
+        request
+            .insert_header(http::header::CONTENT_LENGTH, "4")
+            .unwrap();
+        let (mut session, handle) = HttpSession::new_from_request_header(request);
+        handle
+            .tx
+            .send(HttpTask::Body(Some(Bytes::from_static(b"ping")), true))
+            .await
+            .unwrap();
+        session.read_request().await.unwrap();
+
+        assert_eq!(session.req_header().version, Version::HTTP_3);
+        assert_eq!(session.req_header().method, Method::POST);
+        assert_eq!(session.req_header().uri.path(), "/submit");
+        assert_eq!(
+            session.req_header().headers.get(HOST).unwrap(),
+            "example.com"
+        );
+
+        let body = session.read_body_bytes().await.unwrap().unwrap();
+        assert_eq!(body, Bytes::from_static(b"ping"));
     }
 
     #[tokio::test]

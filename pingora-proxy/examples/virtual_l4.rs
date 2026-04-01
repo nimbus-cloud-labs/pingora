@@ -12,10 +12,9 @@ use pingora_core::protocols::l4::stream::Stream;
 use pingora_core::protocols::l4::virt::{VirtualSocket, VirtualSocketStream};
 use pingora_core::server::RunArgs;
 use pingora_core::server::{configuration::ServerConf, Server};
-use pingora_core::services::listening::Service;
 use pingora_core::upstreams::peer::PeerOptions;
 use pingora_error::Result;
-use pingora_proxy::{http_proxy_service_with_name, prelude::*, HttpProxy, ProxyHttp};
+use pingora_proxy::{http_proxy_service_with_name, prelude::*, HttpProxyService, ProxyHttp};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 /// Static virtual socket that serves a single HTTP request with a static response.
@@ -153,7 +152,7 @@ fn main() {
     let conf = Arc::new(ServerConf::default());
 
     // Build the service and set the default L4 connector
-    let mut svc: Service<HttpProxy<VirtualProxy>> =
+    let mut svc: HttpProxyService<VirtualProxy> =
         http_proxy_service_with_name(&conf, VirtualProxy::new(), "virtual-proxy");
 
     // Listen
