@@ -1271,13 +1271,11 @@ impl Http3UpstreamPool {
             self.stats
                 .expired_sessions
                 .fetch_add(expired, Ordering::Relaxed);
-            observe_quic_event("h3_pool", &destination.name, "session_expired");
         }
 
         if let Some(mut session) = reused_session.take() {
             session.mark_checked_out(now);
             self.stats.reused_sessions.fetch_add(1, Ordering::Relaxed);
-            observe_quic_event("h3_pool", &destination.name, "session_reused");
             return Ok((session, true));
         }
 
@@ -1288,18 +1286,15 @@ impl Http3UpstreamPool {
         self.stats
             .established_sessions
             .fetch_add(1, Ordering::Relaxed);
-        observe_quic_event("h3_pool", &destination.name, "session_established");
         Ok((session, false))
     }
 
     /// Return an upstream HTTP/3 session to the pool.
     pub fn release(&self, mut session: Http3UpstreamSession) {
         let key = upstream_pool_key(session.destination());
-        let destination = session.destination().clone();
         session.mark_released();
         self.sessions.lock().entry(key).or_default().push(session);
         self.stats.released_sessions.fetch_add(1, Ordering::Relaxed);
-        observe_quic_event("h3_pool", &destination.name, "session_released");
     }
 
     /// Remove expired HTTP/3 sessions from the pool and return how many were removed.
@@ -1313,7 +1308,6 @@ impl Http3UpstreamPool {
                 let alive = session.is_alive(now);
                 if !alive {
                     expired += 1;
-                    observe_quic_event("h3_pool", &session.destination().name, "session_expired");
                 }
                 alive
             });
@@ -1366,12 +1360,11 @@ impl QuicTransport for NoopQuicTransport {
 #[cfg_attr(docsrs, doc(cfg(feature = "tokio-quiche")))]
 pub mod tokio_quiche_adapter {
     use super::{
-        default_local_addr_for, observe_quic_event, Http3UpstreamSession, QuicBackend,
-        QuicCertificateKind, QuicConnectionMeta, QuicConnectorConfig, QuicConnectorHandle,
-        QuicDownstreamCloseEvent, QuicDownstreamSession, QuicListenerConfig, QuicListenerStats,
-        QuicListenerStatsInner, QuicStreamCommand, QuicStreamController, QuicStreamDirection,
-        QuicStreamEvent, QuicStreamHandle, QuicTlsCertificate, QuicTransport, QuicUpstreamSession,
-        Result,
+        default_local_addr_for, Http3UpstreamSession, QuicBackend, QuicCertificateKind,
+        QuicConnectionMeta, QuicConnectorConfig, QuicConnectorHandle, QuicDownstreamCloseEvent,
+        QuicDownstreamSession, QuicListenerConfig, QuicListenerStats, QuicListenerStatsInner,
+        QuicStreamCommand, QuicStreamController, QuicStreamDirection, QuicStreamEvent,
+        QuicStreamHandle, QuicTlsCertificate, QuicTransport, QuicUpstreamSession, Result,
     };
     use async_trait::async_trait;
     use parking_lot::Mutex;
@@ -1720,7 +1713,6 @@ pub mod tokio_quiche_adapter {
                     self.stats
                         .handshake_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    observe_quic_event("listener", &self.config.name, "handshake_failed");
                     return Err(Error::because(
                         ErrorType::ReadError,
                         "accepting tokio-quiche initial",
@@ -1761,7 +1753,6 @@ pub mod tokio_quiche_adapter {
                     self.stats
                         .handshake_failures
                         .fetch_add(1, Ordering::Relaxed);
-                    observe_quic_event("listener", &self.config.name, "handshake_failed");
                     return Err(Error::because(
                         ErrorType::TLSHandshakeFailure,
                         "completing tokio-quiche downstream handshake",
@@ -1792,7 +1783,6 @@ pub mod tokio_quiche_adapter {
 
             self.sessions.lock().insert(flow_key, session.clone());
             self.stats.accepted_sessions.fetch_add(1, Ordering::Relaxed);
-            observe_quic_event("listener", &self.config.name, "session_accepted");
             log::info!(
                 "accepted tokio-quiche downstream session {} from {} to {}",
                 self.config.name,
@@ -1810,7 +1800,6 @@ pub mod tokio_quiche_adapter {
 
             if self.sessions.lock().remove(&event.flow_key).is_some() {
                 self.stats.closed_sessions.fetch_add(1, Ordering::Relaxed);
-                observe_quic_event("listener", &self.config.name, "session_closed");
             }
 
             Some(event)
@@ -1940,7 +1929,6 @@ pub mod tokio_quiche_adapter {
         );
 
         stats.handshake_attempts.fetch_add(1, Ordering::Relaxed);
-        observe_quic_event("connector", &config.name, "handshake_started");
         let connection = timeout(
             config.connect_timeout,
             connect_with_config(socket, config.server_name.as_deref(), &params, app),
@@ -1948,7 +1936,6 @@ pub mod tokio_quiche_adapter {
         .await
         .map_err(|_| {
             stats.handshake_timeouts.fetch_add(1, Ordering::Relaxed);
-            observe_quic_event("connector", &config.name, "handshake_timeout");
             Error::explain(
                 ErrorType::ConnectTimedout,
                 "tokio-quiche upstream handshake timed out before session establishment",
@@ -1956,7 +1943,6 @@ pub mod tokio_quiche_adapter {
         })?
         .map_err(|error| {
             stats.handshake_failures.fetch_add(1, Ordering::Relaxed);
-            observe_quic_event("connector", &config.name, "handshake_failed");
             Error::because(
                 ErrorType::TLSHandshakeFailure,
                 "establishing tokio-quiche upstream session",
@@ -1968,7 +1954,6 @@ pub mod tokio_quiche_adapter {
         let negotiated = negotiated.lock().clone();
         let established_at = Instant::now();
         stats.established_sessions.fetch_add(1, Ordering::Relaxed);
-        observe_quic_event("connector", &config.name, "handshake_established");
 
         Ok(QuicUpstreamSession {
             destination: super::QuicUpstreamDestination::from(config),
@@ -2030,21 +2015,18 @@ pub mod tokio_quiche_adapter {
         })?;
 
         let (driver, controller) = ClientH3Driver::new(Http3Settings::default());
-        observe_quic_event("h3_pool", &config.name, "session_establish_started");
         let connection = timeout(
             config.connect_timeout,
             connect_with_config(socket, config.server_name.as_deref(), &params, driver),
         )
         .await
         .map_err(|_| {
-            observe_quic_event("h3_pool", &config.name, "session_establish_timeout");
             Error::explain(
                 ErrorType::ConnectTimedout,
                 "tokio-quiche HTTP/3 upstream handshake timed out before session establishment",
             )
         })?
         .map_err(|error| {
-            observe_quic_event("h3_pool", &config.name, "session_establish_failed");
             Error::because(
                 ErrorType::TLSHandshakeFailure,
                 "establishing tokio-quiche HTTP/3 upstream session",
@@ -2069,7 +2051,6 @@ pub mod tokio_quiche_adapter {
             reuse_count: 0,
             stream_handle: None,
         };
-        observe_quic_event("h3_pool", &config.name, "session_established");
         Ok(Http3UpstreamSession::new(session, controller))
     }
 

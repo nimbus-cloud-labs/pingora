@@ -767,11 +767,34 @@ impl Http3UpstreamExecutor {
 pub async fn execute_stream_upstream<C>(
     connector: &Connector<C>,
     peer: &HttpPeer,
-    request: Http3UpstreamRequest,
+    mut request: Http3UpstreamRequest,
 ) -> Result<Http3UpstreamResponse>
 where
     C: custom::Connector,
 {
+    request.request_header.version = match peer.get_alpn() {
+        Some(alpn) if alpn.get_min_http_version() >= 2 => Version::HTTP_2,
+        _ => Version::HTTP_11,
+    };
+    if request.request_header.version == Version::HTTP_11
+        && !request.body.is_empty()
+        && request
+            .request_header
+            .headers
+            .get(header::CONTENT_LENGTH)
+            .is_none()
+        && request
+            .request_header
+            .headers
+            .get(header::TRANSFER_ENCODING)
+            .is_none()
+    {
+        let body_len: usize = request.body.iter().map(|chunk| chunk.data.len()).sum();
+        request
+            .request_header
+            .insert_header(header::CONTENT_LENGTH, body_len.to_string())?;
+    }
+
     let (mut session, _reused) = connector.get_http_session(peer).await?;
     let response = async {
         session
@@ -854,8 +877,21 @@ pub async fn write_downstream_http3_response(
         return Ok(());
     }
 
-    for chunk in &response.body {
-        writer.send_body(&chunk.data, chunk.fin).await?;
+    if !response.response_trailers_supported {
+        let total_len: usize = response.body.iter().map(|chunk| chunk.data.len()).sum();
+        let mut body = Vec::with_capacity(total_len);
+        for chunk in &response.body {
+            body.extend_from_slice(&chunk.data);
+        }
+        writer.send_body(&body, true).await?;
+        return Ok(());
+    }
+
+    let has_terminal_chunk = response.body.iter().any(|chunk| chunk.fin);
+    for (idx, chunk) in response.body.iter().enumerate() {
+        let is_last = idx + 1 == response.body.len();
+        let fin = chunk.fin || (is_last && !has_terminal_chunk);
+        writer.send_body(&chunk.data, fin).await?;
     }
 
     Ok(())
