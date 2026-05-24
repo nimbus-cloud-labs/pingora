@@ -1423,8 +1423,6 @@ mod tests {
     use futures::{SinkExt, StreamExt};
     use http::header::HOST;
     use http::Version;
-    use hyper::service::{make_service_fn, service_fn};
-    use hyper::{Body, Response, Server};
     use pingora_core::connectors::http::Connector;
     use pingora_core::protocols::l4::datagram::{Datagram, DatagramFlowKey, DatagramMeta};
     use pingora_core::protocols::l4::socket::SocketAddr;
@@ -1437,6 +1435,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Instant;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::mpsc;
     use tokio_quiche::buf_factory::BufFactory;
     use tokio_quiche::http3::driver::{H3Event, ServerH3Event};
@@ -1627,34 +1626,71 @@ mod tests {
     }
 
     async fn spawn_http1_origin() -> std::io::Result<std::net::SocketAddr> {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
-        listener.set_nonblocking(true)?;
-
-        let make_service = make_service_fn(|_| async {
-            Ok::<_, std::convert::Infallible>(service_fn(
-                |request: hyper::Request<Body>| async move {
-                    let path = request.uri().path().to_string();
-                    let body = hyper::body::to_bytes(request.into_body()).await.unwrap();
-                    let mut response_body = format!("{path}|").into_bytes();
-                    response_body.extend_from_slice(&body);
-                    Ok::<_, std::convert::Infallible>(
-                        Response::builder()
-                            .status(200)
-                            .header("x-origin", "http1")
-                            .body(Body::from(response_body))
-                            .unwrap(),
-                    )
-                },
-            ))
-        });
 
         tokio::spawn(async move {
-            let _ = Server::from_tcp(listener)
-                .unwrap()
-                .http1_only(true)
-                .serve(make_service)
-                .await;
+            loop {
+                let Ok((mut tcp, _addr)) = listener.accept().await else {
+                    break;
+                };
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buffer = [0; 1024];
+                    let header_end = loop {
+                        let Ok(read) = tcp.read(&mut buffer).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        request.extend_from_slice(&buffer[..read]);
+                        if let Some(position) =
+                            request.windows(4).position(|window| window == b"\r\n\r\n")
+                        {
+                            break position + 4;
+                        }
+                    };
+
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let path = headers
+                        .lines()
+                        .next()
+                        .and_then(|request_line| request_line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+
+                    let mut body = request[header_end..].to_vec();
+                    while body.len() < content_length {
+                        let Ok(read) = tcp.read(&mut buffer).await else {
+                            return;
+                        };
+                        if read == 0 {
+                            return;
+                        }
+                        body.extend_from_slice(&buffer[..read]);
+                    }
+                    body.truncate(content_length);
+
+                    let mut response_body = format!("{path}|").into_bytes();
+                    response_body.extend_from_slice(&body);
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nx-origin: http1\r\nconnection: close\r\n\r\n",
+                        response_body.len()
+                    );
+                    let _ = tcp.write_all(response.as_bytes()).await;
+                    let _ = tcp.write_all(&response_body).await;
+                });
+            }
         });
 
         Ok(addr)
