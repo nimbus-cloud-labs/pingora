@@ -198,7 +198,7 @@ impl HttpSession {
     /// Create a new subrequest session from a prepared request header.
     pub fn new_from_request_header(mut request: RequestHeader) -> (Self, SubrequestHandle) {
         let request_version = request.version;
-        request.version = Version::HTTP_11;
+        request.set_version(Version::HTTP_11);
         let raw = http_req_header_to_wire(&request)
             .expect("request header must be serializable as HTTP/1.1 for subrequest setup");
         let v1_inner = SessionV1::new(Box::new(DummyIO::new(raw.as_ref())));
@@ -251,7 +251,7 @@ impl HttpSession {
         }
         self.read_req_header = true;
         if let Some(version) = self.request_version_override.take() {
-            self.v1_inner.req_header_mut().version = version;
+            self.v1_inner.req_header_mut().set_version(version);
         }
         if self.clear_request_body_headers {
             // indicated that we wanted to clear these headers in the past, do so now
@@ -1357,7 +1357,7 @@ mod tests_stream {
     async fn read_h3_header_from_prepared_request() {
         init_log();
         let mut request = RequestHeader::build("POST", b"/submit", Some(2)).unwrap();
-        request.version = Version::HTTP_3;
+        request.set_version(Version::HTTP_3);
         request.insert_header(HOST, "example.com").unwrap();
         request
             .insert_header(http::header::CONTENT_LENGTH, "4")

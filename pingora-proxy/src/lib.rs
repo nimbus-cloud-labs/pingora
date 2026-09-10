@@ -662,7 +662,7 @@ where
         match outcome {
             Http3UpstreamOutcome::Response(response) => {
                 let mut response_header = response.response_header;
-                response_header.version = session.req_header().version;
+                response_header.set_version(session.req_header().version);
                 if let Err(error) = self
                     .inner
                     .upstream_response_filter(session, &mut response_header, ctx)

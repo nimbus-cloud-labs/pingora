@@ -162,7 +162,7 @@ pub fn ssl_export_keying_material(
 
 /// Create a new [`Ssl`] from &[`SslAcceptor`]
 pub fn ssl_from_acceptor(acceptor: &SslAcceptor) -> Result<Ssl, ErrorStack> {
-    Ssl::new(acceptor.context())
+    Ssl::new(&acceptor.context().to_owned())
 }
 
 /// Suspend the TLS handshake when a certificate is needed.
