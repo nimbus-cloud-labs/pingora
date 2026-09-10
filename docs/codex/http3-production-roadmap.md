@@ -124,7 +124,17 @@ Work should proceed in this order:
 3. Streaming and load validation
 4. Observability and operations
 5. Support boundary and release readiness
+6. Post-0.9 QUIC backend reevaluation
 
 This order keeps the next cycle evidence-driven. It avoids over-tuning the
 system before we know which behaviors actually fail under realistic peers and
 traffic.
+
+## Post-0.9 QUIC Backend Reevaluation
+
+Keep `quiche`/`tokio-quiche` for the 0.9 release. Before the next QUIC or
+HTTP/3 release, reevaluate Quinn with `h3`/`h3-quinn` as the transport stack.
+The decision should compare TLS and dependency compatibility, API stability,
+interoperability, performance, and migration cost. Select one backend rather
+than maintaining both unless production requirements demonstrate a need for
+multiple implementations.
