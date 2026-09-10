@@ -772,11 +772,12 @@ pub async fn execute_stream_upstream<C>(
 where
     C: custom::Connector,
 {
-    request.request_header.version = match peer.get_alpn() {
+    let version = match peer.get_alpn() {
         Some(alpn) if alpn.get_min_http_version() >= 2 => Version::HTTP_2,
         _ => Version::HTTP_11,
     };
-    if request.request_header.version == Version::HTTP_11
+    request.request_header.set_version(version);
+    if version == Version::HTTP_11
         && !request.body.is_empty()
         && request
             .request_header
@@ -1162,7 +1163,7 @@ impl Http3ProxyBridge {
             &accepted.path,
             Some(accepted.headers.len() + 1),
         )?;
-        request.version = Version::HTTP_3;
+        request.set_version(Version::HTTP_3);
 
         if let Some(authority) = &accepted.authority {
             request.insert_header(HOST, authority)?;
@@ -1232,7 +1233,7 @@ impl Http3ProxyBridge {
             )
         })?;
         let mut request = RequestHeader::build(method, &path, Some(regular_headers.len() + 1))?;
-        request.version = Version::HTTP_3;
+        request.set_version(Version::HTTP_3);
 
         if let Some(authority) = authority {
             request.insert_header(HOST, authority)?;
@@ -1365,7 +1366,7 @@ fn response_header_from_h3_headers(headers: &[H3Header]) -> Result<ResponseHeade
         })?,
         Some(regular_headers.len()),
     )?;
-    response.version = Version::HTTP_3;
+    response.set_version(Version::HTTP_3);
     for (name, value) in regular_headers {
         response.append_header(
             name,
