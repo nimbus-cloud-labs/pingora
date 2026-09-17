@@ -15,7 +15,7 @@
 #[global_allocator]
 static ALLOC: dhat::Alloc = dhat::Alloc;
 
-use rand::prelude::*;
+use rand_distr::Distribution;
 use std::num::NonZeroUsize;
 
 const ITERATIONS: usize = 5_000_000;
