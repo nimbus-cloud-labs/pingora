@@ -1067,6 +1067,7 @@ pub mod range_filter {
     use super::*;
     use bytes::BytesMut;
     use http::header::*;
+    use rand::RngExt;
     use std::ops::Range;
 
     // parse bytes into usize, ignores specific error
@@ -1378,9 +1379,8 @@ pub mod range_filter {
         // Per [RFC 2046](https://www.rfc-editor.org/rfc/rfc2046#section-5.1.1), the boundary should be no longer than 70 characters
         // and it must not match the body content.
         fn generate_boundary() -> String {
-            use rand::Rng;
-            let mut rng: rand::prelude::ThreadRng = rand::thread_rng();
-            format!("{:016x}", rng.gen::<u64>())
+            let mut rng: rand::prelude::ThreadRng = rand::rng();
+            format!("{:016x}", rng.random::<u64>())
         }
         pub fn calculate_multipart_length(&self) -> usize {
             let mut total_length = 0;

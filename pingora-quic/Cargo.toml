@@ -23,7 +23,7 @@ pingora-core = { version = "0.9.0", path = "../pingora-core", default-features =
 pingora-error = { version = "0.9.0", path = "../pingora-error" }
 tokio = { workspace = true, features = ["rt", "time"] }
 tokio-stream = { version = "0.1", optional = true }
-tokio-quiche = { git = "https://github.com/cloudflare/quiche.git", optional = true }
+tokio-quiche = { version = "0.20.0", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
