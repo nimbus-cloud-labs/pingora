@@ -584,10 +584,7 @@ impl UdpLoadBalancer {
                     removed_count
                 );
                 let mut flow_table = self.flow_table.lock();
-                let peer = match self.peers.select(self.selection_mode, &flow_key) {
-                    Some(peer) => peer.clone(),
-                    None => return None,
-                };
+                let peer = self.peers.select(self.selection_mode, &flow_key)?.clone();
                 match flow_table.upsert(flow_key.clone(), peer.clone()) {
                     UdpFlowInsert::Inserted | UdpFlowInsert::Replaced => {}
                     UdpFlowInsert::TableFull => {

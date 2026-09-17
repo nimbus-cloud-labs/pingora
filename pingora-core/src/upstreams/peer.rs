@@ -26,7 +26,7 @@ use crate::protocols::ConnFdReusable;
 use crate::protocols::TcpKeepalive;
 use crate::utils::tls::{get_organization_unit, CertKey};
 use ahash::AHasher;
-use derivative::Derivative;
+use derive_where::derive_where;
 use pingora_error::{
     ErrorType::{InternalError, SocketError},
     OrErr, Result,
@@ -494,8 +494,8 @@ pub enum H1UpgradePolicy {
 ///
 /// See [`Peer`] for the meaning of the fields
 #[non_exhaustive]
-#[derive(Clone, Derivative)]
-#[derivative(Debug)]
+#[derive(Clone)]
+#[derive_where(Debug)]
 pub struct PeerOptions {
     pub bind_to: Option<BindTo>,
     pub connection_timeout: Option<Duration>,
@@ -555,17 +555,17 @@ pub struct PeerOptions {
     pub tracer: Option<Tracer>,
     /// A custom L4 connector to use to establish new L4 connections
     pub custom_l4: Option<Arc<dyn L4Connect + Send + Sync>>,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip)]
     pub upstream_tcp_sock_tweak_hook:
         Option<Arc<dyn Fn(&TcpSocket) -> Result<()> + Send + Sync + 'static>>,
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip)]
     pub proxy_digest_user_data_hook: Option<ProxyDigestUserDataHook>,
     /// Hook that allows returning an optional `SslDigestExtension`.
     /// Any returned value will be saved into the `SslDigest`.
     ///
     /// Currently only enabled for openssl variants with meaningful `TlsRef`s.
     #[cfg(feature = "openssl_derived")]
-    #[derivative(Debug = "ignore")]
+    #[derive_where(skip)]
     pub upstream_tls_handshake_complete_hook: Option<HandshakeCompleteHook>,
 }
 

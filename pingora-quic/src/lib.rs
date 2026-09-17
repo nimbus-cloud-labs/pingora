@@ -1382,7 +1382,7 @@ pub mod tokio_quiche_adapter {
     use tokio_quiche::http3::driver::ClientH3Driver;
     use tokio_quiche::http3::settings::Http3Settings;
     use tokio_quiche::metrics::DefaultMetrics;
-    use tokio_quiche::quic::connect_with_config;
+    use tokio_quiche::quic::{connect_with_config, QuicheConnection};
     use tokio_quiche::settings::{
         CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
     };
@@ -1422,7 +1422,7 @@ pub mod tokio_quiche_adapter {
 
         fn emit_read_events(
             &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
+            qconn: &mut QuicheConnection,
         ) -> tokio_quiche::QuicResult<()> {
             for stream_id in qconn.readable() {
                 if self.seen_streams.insert(stream_id) {
@@ -1457,7 +1457,7 @@ pub mod tokio_quiche_adapter {
             Ok(())
         }
 
-        fn enqueue_writable_events(&mut self, qconn: &mut tokio_quiche::quiche::Connection) {
+        fn enqueue_writable_events(&mut self, qconn: &mut QuicheConnection) {
             for stream_id in qconn.writable() {
                 if self.writable_streams.insert(stream_id) {
                     let _ = self.event_tx.send(QuicStreamEvent::Writable { stream_id });
@@ -1471,7 +1471,7 @@ pub mod tokio_quiche_adapter {
 
         fn drain_pending_commands(
             &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
+            qconn: &mut QuicheConnection,
         ) -> tokio_quiche::QuicResult<()> {
             while let Some(command) = self.pending_commands.pop_front() {
                 match command {
@@ -1559,7 +1559,7 @@ pub mod tokio_quiche_adapter {
     impl tokio_quiche::ApplicationOverQuic for TokioQuicheSessionApp {
         fn on_conn_established(
             &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
+            qconn: &mut QuicheConnection,
             _handshake_info: &tokio_quiche::quic::HandshakeInfo,
         ) -> tokio_quiche::QuicResult<()> {
             let alpn =
@@ -1579,13 +1579,9 @@ pub mod tokio_quiche_adapter {
             true
         }
 
-        fn buffer(&mut self) -> &mut [u8] {
-            &mut self.runtime.buffer
-        }
-
         async fn wait_for_data(
             &mut self,
-            _qconn: &mut tokio_quiche::quiche::Connection,
+            _qconn: &mut QuicheConnection,
         ) -> tokio_quiche::QuicResult<()> {
             match self.runtime.cmd_rx.recv().await {
                 Some(command) => {
@@ -1599,17 +1595,11 @@ pub mod tokio_quiche_adapter {
             }
         }
 
-        fn process_reads(
-            &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
-        ) -> tokio_quiche::QuicResult<()> {
+        fn process_reads(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
             self.runtime.emit_read_events(qconn)
         }
 
-        fn process_writes(
-            &mut self,
-            qconn: &mut tokio_quiche::quiche::Connection,
-        ) -> tokio_quiche::QuicResult<()> {
+        fn process_writes(&mut self, qconn: &mut QuicheConnection) -> tokio_quiche::QuicResult<()> {
             while let Ok(command) = self.runtime.cmd_rx.try_recv() {
                 self.runtime.queue_command(command);
             }
@@ -1620,7 +1610,7 @@ pub mod tokio_quiche_adapter {
 
         fn on_conn_close<M: tokio_quiche::metrics::Metrics>(
             &mut self,
-            _qconn: &mut tokio_quiche::quiche::Connection,
+            _qconn: &mut QuicheConnection,
             _metrics: &M,
             connection_result: &tokio_quiche::QuicResult<()>,
         ) {
@@ -2192,6 +2182,8 @@ mod tests {
     #[cfg(feature = "tokio-quiche")]
     use std::sync::Arc;
     use std::time::Duration;
+    #[cfg(feature = "tokio-quiche")]
+    use tokio_quiche::quic::QuicheConnection;
 
     fn downstream_listener_config(listen_addr: SocketAddr) -> QuicListenerConfig {
         let mut config = QuicListenerConfig::new("h3-listener", listen_addr);
@@ -2569,7 +2561,7 @@ mod tests {
         impl tokio_quiche::ApplicationOverQuic for TestClientApp {
             fn on_conn_established(
                 &mut self,
-                _qconn: &mut tokio_quiche::quiche::Connection,
+                _qconn: &mut QuicheConnection,
                 _handshake_info: &tokio_quiche::quic::HandshakeInfo,
             ) -> tokio_quiche::QuicResult<()> {
                 Ok(())
@@ -2579,13 +2571,9 @@ mod tests {
                 false
             }
 
-            fn buffer(&mut self) -> &mut [u8] {
-                &mut self.buffer
-            }
-
             async fn wait_for_data(
                 &mut self,
-                _qconn: &mut tokio_quiche::quiche::Connection,
+                _qconn: &mut QuicheConnection,
             ) -> tokio_quiche::QuicResult<()> {
                 pending::<()>().await;
                 Ok(())
@@ -2593,14 +2581,14 @@ mod tests {
 
             fn process_reads(
                 &mut self,
-                _qconn: &mut tokio_quiche::quiche::Connection,
+                _qconn: &mut QuicheConnection,
             ) -> tokio_quiche::QuicResult<()> {
                 Ok(())
             }
 
             fn process_writes(
                 &mut self,
-                _qconn: &mut tokio_quiche::quiche::Connection,
+                _qconn: &mut QuicheConnection,
             ) -> tokio_quiche::QuicResult<()> {
                 Ok(())
             }
