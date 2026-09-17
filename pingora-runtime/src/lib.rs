@@ -237,11 +237,7 @@ pub enum RuntimeMetricsPollTimeHistogramScale {
 ///
 /// The `NoSteal` flavor is backed by multiple tokio single-threaded runtime.
 pub enum Runtime {
-    Steal {
-        runtime: tokio::runtime::Runtime,
-        #[cfg(feature = "dial9")]
-        dial9_guard: Option<dial9_tokio_telemetry::telemetry::TelemetryGuard>,
-    },
+    Steal { runtime: tokio::runtime::Runtime },
     NoSteal(NoStealRuntime),
 }
 
@@ -308,11 +304,10 @@ fn build_dial9_runtime(
     builder: Builder,
     runtime_name: &str,
     opts: &Dial9RuntimeOpts,
-) -> std::io::Result<(
-    tokio::runtime::Runtime,
-    dial9_tokio_telemetry::telemetry::TelemetryGuard,
-)> {
-    use dial9_tokio_telemetry::telemetry::{RotatingWriter, TracedRuntime};
+) -> std::io::Result<tokio::runtime::Runtime> {
+    use dial9_tokio_telemetry::telemetry::{
+        Dial9HandleTokioExt, DiskBuffer, RecorderPipelineExt, TokioAttachOptions,
+    };
     use std::io::{Error, ErrorKind};
 
     if opts.max_file_size == 0 {
@@ -344,19 +339,16 @@ fn build_dial9_runtime(
         std::fs::create_dir_all(parent)?;
     }
 
-    let writer = RotatingWriter::builder()
+    let writer = DiskBuffer::builder()
         .base_path(opts.trace_path.clone())
         .max_file_size(opts.max_file_size)
         .max_total_size(opts.max_total_size)
         .maybe_rotation_period(opts.rotation_period)
-        .build()?;
+        .build();
 
-    let mut traced = TracedRuntime::builder()
-        .with_trace_path(opts.trace_path.clone())
-        .with_runtime_name(runtime_name)
-        .with_task_tracking(opts.task_tracking);
+    let mut recorder_builder = dial9::recorder_or_disabled(writer);
     if let Some(worker_poll_interval) = opts.worker_poll_interval {
-        traced = traced.with_worker_poll_interval(worker_poll_interval);
+        recorder_builder = recorder_builder.worker_poll_interval(worker_poll_interval);
     }
 
     #[cfg(feature = "dial9-worker-s3")]
@@ -373,22 +365,25 @@ fn build_dial9_runtime(
                 "dial9 s3 service_name must not be empty",
             ));
         }
-        let s3_config = dial9_tokio_telemetry::background_task::s3::S3Config::builder()
-            .bucket(s3_upload.bucket.clone())
-            .service_name(s3_upload.service_name.clone())
-            .maybe_prefix(s3_upload.prefix.clone())
-            .maybe_region(s3_upload.region.clone())
-            .maybe_instance_path(s3_upload.instance_path.clone());
-        let traced = traced.with_s3_uploader(s3_config.build());
-        if let Some(client) = s3_upload.client.clone() {
-            return traced
-                .with_s3_client(client)
-                .build_and_start(builder, writer);
-        }
-        return traced.build_and_start(builder, writer);
+        let s3_config =
+            dial9_tokio_telemetry::background_task::dial9_destinations_s3::S3Config::builder()
+                .bucket(s3_upload.bucket.clone())
+                .service_name(s3_upload.service_name.clone())
+                .maybe_prefix(s3_upload.prefix.clone())
+                .maybe_region(s3_upload.region.clone())
+                .maybe_instance_path(s3_upload.instance_path.clone());
+
+        recorder_builder = recorder_builder.with_s3_uploader(s3_config.build());
     }
 
-    traced.build_and_start(builder, writer)
+    let recorder = recorder_builder.build();
+    recorder.handle().attach_tokio_runtime(
+        builder,
+        TokioAttachOptions::builder()
+            .runtime_name(runtime_name)
+            .task_tracking_enabled(opts.task_tracking)
+            .build(),
+    )
 }
 
 /// Builder for constructing a [`Runtime`].
@@ -481,34 +476,25 @@ impl RuntimeBuilder {
         if self.work_steal {
             let mut builder = self.build_work_stealing_tokio_builder();
             #[cfg(feature = "dial9")]
-            let dial9_guard = if let Some(dial9_opts) = &self.runtime_opts.dial9 {
+            if let Some(dial9_opts) = &self.runtime_opts.dial9 {
                 let runtime_name = self.name.clone();
                 match build_dial9_runtime(builder, &runtime_name, dial9_opts) {
-                    Ok((runtime, guard)) => {
-                        return Runtime::Steal {
-                            runtime,
-                            dial9_guard: Some(guard),
-                        };
+                    Ok(runtime) => {
+                        return Runtime::Steal { runtime };
                     }
                     Err(e) => {
                         log::warn!(
                             "failed to initialize dial9 runtime telemetry for {runtime_name}: {e}"
                         );
                         builder = self.build_work_stealing_tokio_builder();
-                        None
                     }
                 }
-            } else {
-                None
-            };
+            }
+
             let runtime = builder
                 .build()
                 .expect("failed to build work-stealing Tokio runtime");
-            Runtime::Steal {
-                runtime,
-                #[cfg(feature = "dial9")]
-                dial9_guard,
-            }
+            Runtime::Steal { runtime }
         } else {
             #[cfg(feature = "dial9")]
             if self.runtime_opts.dial9.is_some() {
@@ -551,13 +537,7 @@ impl Runtime {
     /// all runtimes exit.
     pub fn shutdown_timeout(self, timeout: Duration) {
         match self {
-            Self::Steal {
-                runtime,
-                #[cfg(feature = "dial9")]
-                dial9_guard,
-            } => {
-                #[cfg(feature = "dial9")]
-                drop(dial9_guard);
+            Self::Steal { runtime } => {
                 runtime.shutdown_timeout(timeout);
             }
             Self::NoSteal(r) => r.shutdown_timeout(timeout),

@@ -14,9 +14,11 @@
 
 //! Downstream HTTP/3 bridging on top of the QUIC transport layer.
 
+use bytes::Bytes;
 use futures::SinkExt;
 use http::header::{self, CONNECTION, HOST, UPGRADE};
 use http::Version;
+use pingora_core::apps::HttpServerApp;
 use pingora_core::connectors::http::{custom, Connector};
 use pingora_core::protocols::http::subrequest::server::HttpSession as SubrequestSession;
 use pingora_core::protocols::http::{HttpTask, ServerSession};
@@ -37,11 +39,12 @@ use tokio_quiche::http3::driver::{
     ClientH3Event, H3Event, InboundFrame, InboundFrameStream, IncomingH3Headers, NewClientRequest,
     OutboundFrame, OutboundFrameSender,
 };
-use tokio_quiche::quiche::h3::{Header as H3Header, NameValue};
+use tokio_quiche::quiche::{
+    h3::{Header as H3Header, NameValue},
+    BufFactory as _,
+};
 
 use crate::{HttpProxy, ProxyHttp};
-use bytes::Bytes;
-use pingora_core::apps::HttpServerApp;
 
 /// Compatibility status for a proxy phase when used with downstream HTTP/3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -414,7 +417,7 @@ impl Http3BodyReader {
 
         match frame {
             InboundFrame::Body(buf, fin) => Ok(Some(Http3BodyChunk {
-                data: buf.into_inner().into_vec(),
+                data: buf.to_vec(),
                 fin,
             })),
             InboundFrame::Datagram(_) => Error::e_explain(
@@ -468,7 +471,7 @@ impl Http3ResponseWriter {
     /// Write response body bytes to the downstream stream.
     pub async fn send_body(&mut self, body: &[u8], fin: bool) -> Result<()> {
         self.send
-            .send(OutboundFrame::body(BufFactory::buf_from_slice(body), fin))
+            .send(OutboundFrame::Body(BufFactory::buf_from_slice(body), fin))
             .await
             .map_err(|_| {
                 Error::explain(
@@ -684,7 +687,7 @@ impl Http3UpstreamExecutor {
             })?;
             for chunk in &request.body {
                 body_writer
-                    .send(OutboundFrame::body(
+                    .send(OutboundFrame::Body(
                         BufFactory::buf_from_slice(&chunk.data),
                         chunk.fin,
                     ))
@@ -1394,7 +1397,7 @@ async fn read_http3_body(
         match frame {
             InboundFrame::Body(buf, fin) => {
                 body.push(Http3BodyChunk {
-                    data: buf.into_inner().into_vec(),
+                    data: buf.to_vec(),
                     fin,
                 });
                 if fin {
@@ -1444,7 +1447,10 @@ mod tests {
     use tokio_quiche::http3::settings::Http3Settings;
     use tokio_quiche::http3::H3AuditStats;
     use tokio_quiche::metrics::DefaultMetrics;
-    use tokio_quiche::quiche::h3::{Header as H3Header, NameValue};
+    use tokio_quiche::quiche::{
+        h3::{Header as H3Header, NameValue},
+        BufFactory as _,
+    };
     use tokio_quiche::settings::{
         CertificateKind, ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths,
     };
@@ -1608,7 +1614,7 @@ mod tests {
                                 ))
                                 .await
                                 .unwrap();
-                                send.send(OutboundFrame::body(
+                                send.send(OutboundFrame::Body(
                                     BufFactory::buf_from_slice(&response_body),
                                     true,
                                 ))
@@ -1849,14 +1855,14 @@ mod tests {
         let (response_tx, _response_rx) = mpsc::channel(4);
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"ping"),
+                BufFactory::buf_from_slice(b"ping").into(),
                 false,
             ))
             .await
             .unwrap();
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"pong"),
+                BufFactory::buf_from_slice(b"pong").into(),
                 true,
             ))
             .await
@@ -2238,14 +2244,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(4);
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"ping"),
+                BufFactory::buf_from_slice(b"ping").into(),
                 false,
             ))
             .await
             .unwrap();
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"pong"),
+                BufFactory::buf_from_slice(b"pong").into(),
                 true,
             ))
             .await
@@ -2306,14 +2312,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(4);
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"ping"),
+                BufFactory::buf_from_slice(b"ping").into(),
                 false,
             ))
             .await
             .unwrap();
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"pong"),
+                BufFactory::buf_from_slice(b"pong").into(),
                 true,
             ))
             .await
@@ -2376,14 +2382,14 @@ mod tests {
         let (response_tx, mut response_rx) = mpsc::channel(4);
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"ping"),
+                BufFactory::buf_from_slice(b"ping").into(),
                 false,
             ))
             .await
             .unwrap();
         body_tx
             .send(InboundFrame::Body(
-                BufFactory::buf_from_slice(b"pong"),
+                BufFactory::buf_from_slice(b"pong").into(),
                 true,
             ))
             .await

@@ -126,12 +126,8 @@
 //! 6. The task guard clears the slot's running state and notifies waiters.
 //! 7. After destruction completes, the gate permit is released.
 
-// https://github.com/mcarton/rust-derivative/issues/112
-// False positive for macro generated code
-#![allow(clippy::non_canonical_partial_ord_impl)]
-
 use arc_swap::ArcSwap;
-use derivative::Derivative;
+use derive_where::derive_where;
 use futures::FutureExt;
 pub use http::Extensions;
 use pingora_core::protocols::l4::socket::SocketAddr;
@@ -167,8 +163,8 @@ pub mod prelude {
 }
 
 /// [Backend] represents a server to proxy or connect to.
-#[derive(Derivative)]
-#[derivative(Clone, Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
+#[derive(Clone)]
+#[derive_where(Hash, PartialEq, PartialOrd, Eq, Ord, Debug)]
 pub struct Backend {
     /// The address to the backend server.
     pub addr: SocketAddr,
@@ -182,10 +178,7 @@ pub struct Backend {
     /// [SocketAddr] and the same weight but different `ext` data are considered
     /// identical.
     /// See [Extensions] for how to add and read the data.
-    #[derivative(PartialEq = "ignore")]
-    #[derivative(PartialOrd = "ignore")]
-    #[derivative(Hash = "ignore")]
-    #[derivative(Ord = "ignore")]
+    #[derive_where(skip)]
     pub ext: Extensions,
 }
 
