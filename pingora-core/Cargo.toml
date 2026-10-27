@@ -96,7 +96,7 @@ http-body-util = "0.1"
 rstest = "0.23.0"
 # Only used for types in tests; the crypto provider arrives through
 # pingora-rustls, so no provider feature is selected here.
-rustls = { version = "0.23", default-features = false, features = [
+rustls = { version = "0.23.46", default-features = false, features = [
     "logging",
     "std",
     "tls12",
