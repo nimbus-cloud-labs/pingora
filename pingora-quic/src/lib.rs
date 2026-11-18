@@ -2546,17 +2546,7 @@ mod tests {
         use tokio_quiche::settings::{ConnectionParams, Hooks, QuicSettings};
         use tokio_quiche::socket::Socket;
 
-        struct TestClientApp {
-            buffer: Vec<u8>,
-        }
-
-        impl Default for TestClientApp {
-            fn default() -> Self {
-                Self {
-                    buffer: vec![0; 1350],
-                }
-            }
-        }
+        struct TestClientApp;
 
         impl tokio_quiche::ApplicationOverQuic for TestClientApp {
             fn on_conn_established(
@@ -2622,7 +2612,7 @@ mod tests {
             settings.verify_peer = false;
             settings.max_idle_timeout = Some(Duration::from_secs(30));
             let params = ConnectionParams::new_client(settings, None, Hooks::default());
-            connect_with_config(socket, Some("localhost"), &params, TestClientApp::default())
+            connect_with_config(socket, Some("localhost"), &params, TestClientApp)
                 .await
                 .unwrap()
         });

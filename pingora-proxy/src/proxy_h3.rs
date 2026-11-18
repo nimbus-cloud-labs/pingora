@@ -1890,6 +1890,7 @@ mod tests {
         drop(body_tx);
 
         let incoming_headers = IncomingH3Headers {
+            dgram_flow: None,
             stream_id: 4,
             headers: vec![
                 H3Header::new(b":method", b"POST"),
@@ -1987,6 +1988,7 @@ mod tests {
         let (_body_tx, body_rx) = mpsc::channel(1);
         let (response_tx, mut response_rx) = mpsc::channel(4);
         let incoming_headers = IncomingH3Headers {
+            dgram_flow: None,
             stream_id: 8,
             headers: vec![
                 H3Header::new(b":method", b"GET"),
@@ -2329,6 +2331,7 @@ mod tests {
         drop(body_tx);
 
         let incoming_headers = IncomingH3Headers {
+            dgram_flow: None,
             stream_id: 12,
             headers: vec![
                 H3Header::new(b":method", b"POST"),
@@ -2397,6 +2400,7 @@ mod tests {
         drop(body_tx);
 
         let incoming_headers = IncomingH3Headers {
+            dgram_flow: None,
             stream_id: 16,
             headers: vec![
                 H3Header::new(b":method", b"POST"),
@@ -2467,6 +2471,7 @@ mod tests {
         drop(body_tx);
 
         let incoming_headers = IncomingH3Headers {
+            dgram_flow: None,
             stream_id: 20,
             headers: vec![
                 H3Header::new(b":method", b"POST"),
