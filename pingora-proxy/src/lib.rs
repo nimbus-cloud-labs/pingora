@@ -114,12 +114,12 @@ use subrequest::{BodyMode, Ctx as SubrequestCtx};
 pub use proxy_cache::range_filter::{range_header_filter, MultiRangeInfo, RangeType};
 #[cfg(feature = "http3")]
 pub use proxy_h3::{
-    DownstreamHttpVersion, Http3AcceptedStream, Http3BridgeStats, Http3CompatibilityReport,
-    Http3DownstreamRequest, Http3DownstreamSession, Http3Negotiation, Http3PhaseCompatibility,
-    Http3ProxyBridge, Http3ResponseWriter, Http3RetryAction, Http3RetryClassifier,
-    Http3RetryContext, Http3RetryDecision, Http3RetryPolicy, Http3UpstreamBodyChunk,
-    Http3UpstreamExecutor, Http3UpstreamOutcome, Http3UpstreamRequest, Http3UpstreamResponse,
-    SelectedHttpUpstream,
+    DownstreamHttpVersion, Http3AcceptedStream, Http3BridgeStats, Http3ClientIdentity,
+    Http3CompatibilityReport, Http3DownstreamRequest, Http3DownstreamSession, Http3Negotiation,
+    Http3PhaseCompatibility, Http3ProxyBridge, Http3ResponseWriter, Http3RetryAction,
+    Http3RetryClassifier, Http3RetryContext, Http3RetryDecision, Http3RetryPolicy,
+    Http3UpstreamBodyChunk, Http3UpstreamExecutor, Http3UpstreamOutcome, Http3UpstreamRequest,
+    Http3UpstreamResponse, SelectedHttpUpstream,
 };
 pub use proxy_purge::PurgeStatus;
 pub use proxy_trait::{FailToProxy, ProxyHttp, ProxyWarnLogContext};
@@ -220,7 +220,7 @@ where
     pub threads: Option<usize>,
     runtime_opts_override: Option<RuntimeOptsOverride>,
     #[cfg(feature = "http3")]
-    http3_listeners: Vec<QuicListenerConfig>,
+    http3_listeners: Vec<(QuicListenerConfig, Option<std::path::PathBuf>)>,
     #[cfg(feature = "connection_filter")]
     connection_filter: Arc<dyn ConnectionFilter>,
 }
@@ -2035,14 +2035,35 @@ where
             QuicCertificateKind::X509,
         )));
         config.validate()?;
-        self.http3_listeners.push(config);
+        self.http3_listeners.push((config, None));
         Ok(())
     }
 
     #[cfg(feature = "http3")]
     pub fn add_http3_with_settings(&mut self, config: QuicListenerConfig) -> Result<()> {
         config.validate()?;
-        self.http3_listeners.push(config);
+        self.http3_listeners.push((config, None));
+        Ok(())
+    }
+
+    /// Add an HTTP/3 listener that verifies client certificates against a PEM CA bundle.
+    ///
+    /// Clients without a certificate are accepted. Requests expose the handshake
+    /// SNI and optional verified DER leaf as an [Http3ClientIdentity] in the TLS digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the endpoint, server credentials or client CA bundle are invalid.
+    #[cfg(feature = "http3")]
+    pub fn add_http3_with_optional_client_auth(
+        &mut self,
+        config: QuicListenerConfig,
+        client_ca: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        config.validate()?;
+        proxy_h3::client_auth_hooks(&config, client_ca.as_ref())?;
+        self.http3_listeners
+            .push((config, Some(client_ca.as_ref().to_owned())));
         Ok(())
     }
 
@@ -2050,6 +2071,7 @@ where
     async fn run_http3_endpoint(
         app_logic: Arc<HttpProxy<SV, C>>,
         config: QuicListenerConfig,
+        client_ca: Option<std::path::PathBuf>,
         shutdown: ShutdownWatch,
     ) {
         use futures::StreamExt;
@@ -2060,7 +2082,24 @@ where
         use tokio_quiche::http3::driver::{H3Event, ServerH3Event};
         use tokio_quiche::http3::settings::Http3Settings;
         use tokio_quiche::metrics::DefaultMetrics;
-        use tokio_quiche::settings::{ConnectionParams, Hooks, QuicSettings, TlsCertificatePaths};
+        use tokio_quiche::quic::QuicCommand;
+        use tokio_quiche::settings::{ConnectionParams, QuicSettings, TlsCertificatePaths};
+
+        let hooks = match client_ca
+            .as_deref()
+            .map(|ca| proxy_h3::client_auth_hooks(&config, ca))
+            .transpose()
+        {
+            Ok(hooks) => hooks.unwrap_or_default(),
+            Err(error) => {
+                error!(
+                    "configuring downstream HTTP/3 client authentication for {} failed: {error}",
+                    config.name
+                );
+                return;
+            }
+        };
+        let client_auth_enabled = client_ca.is_some();
 
         let local_addr = *config
             .listen_addr
@@ -2098,7 +2137,7 @@ where
                     }
                 },
             },
-            Hooks::default(),
+            hooks,
         );
         let mut listeners = match tokio_quiche::listen([socket], params, DefaultMetrics) {
             Ok(listeners) => listeners,
@@ -2160,7 +2199,26 @@ where
                 let bridge = crate::Http3ProxyBridge::new();
                 let (driver, mut controller) =
                     tokio_quiche::ServerH3Driver::new(Http3Settings::default());
-                connection.start(driver);
+                let ssl_digest = if client_auth_enabled {
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    if controller
+                        .cmd_sender()
+                        .send(QuicCommand::Custom(Box::new(move |conn| {
+                            let _ = sender.send(proxy_h3::client_auth_digest(conn));
+                        })))
+                        .is_err()
+                    {
+                        return;
+                    }
+                    connection.start(driver);
+                    let Ok(Some(digest)) = receiver.await else {
+                        return;
+                    };
+                    Some(Arc::new(digest))
+                } else {
+                    connection.start(driver);
+                    None
+                };
                 while let Some(event) = controller.event_receiver_mut().recv().await {
                     match event {
                         ServerH3Event::Headers {
@@ -2179,6 +2237,7 @@ where
                                 app.clone(),
                                 request,
                                 &shutdown,
+                                ssl_digest.clone(),
                             )
                             .await
                             {
@@ -2238,11 +2297,11 @@ where
         }));
 
         #[cfg(feature = "http3")]
-        for listener in self.http3_listeners.clone() {
+        for (listener, client_ca) in self.http3_listeners.clone() {
             let app_logic = app_logic.clone();
             let shutdown = shutdown.clone();
             handlers.push(tokio::spawn(async move {
-                Self::run_http3_endpoint(app_logic, listener, shutdown).await;
+                Self::run_http3_endpoint(app_logic, listener, client_ca, shutdown).await;
             }));
         }
 

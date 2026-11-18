@@ -729,6 +729,11 @@ impl HttpSession {
         self.total_drain_timeout
     }
 
+    /// Set trusted transport metadata for a session created from request headers.
+    pub fn set_digest(&mut self, digest: Digest) {
+        self.digest = Some(Box::new(digest));
+    }
+
     /// Return the [Digest], this is originally from the main request.
     pub fn digest(&self) -> Option<&Digest> {
         self.digest.as_deref()

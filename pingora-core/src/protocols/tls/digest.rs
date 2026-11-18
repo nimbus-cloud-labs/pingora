@@ -56,6 +56,12 @@ impl SslDigest {
             extension: SslDigestExtension::default(),
         }
     }
+
+    /// Attach typed TLS metadata to this connection digest.
+    pub fn with_extension<T: Send + Sync + 'static>(mut self, extension: T) -> Self {
+        self.extension.set(Arc::new(extension));
+        self
+    }
 }
 
 /// The user-defined TLS data
@@ -75,7 +81,6 @@ impl SslDigestExtension {
         self.value.as_ref().and_then(|v| v.downcast_ref::<T>())
     }
 
-    #[allow(dead_code)]
     pub(crate) fn set(&mut self, value: Arc<dyn Any + Send + Sync>) {
         self.value = Some(value);
     }

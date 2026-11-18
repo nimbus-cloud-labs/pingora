@@ -110,6 +110,21 @@ The standard listener path has been validated locally for:
   round trip through the normal `http_proxy_service()` entrypoint
 - request-body-bearing local routes on the same standard listener path
 
+### Optional client certificate verification
+
+Use `HttpProxyService::add_http3_with_optional_client_auth` with a QUIC listener
+configuration and a PEM bundle containing the trusted client CAs. The client
+certificate is optional, but a certificate that fails verification terminates
+the handshake. Session resumption is disabled for these listeners.
+
+The request filter can read `pingora_proxy::Http3ClientIdentity` through
+`session.as_downstream().digest()`, then `ssl_digest.extension.get()`. The
+identity contains the authenticated connection's TLS server name and the
+original verified DER leaf, if a client certificate was supplied. The CA
+bundle applies to the entire UDP socket. Before using the certificate to
+authorize an HTTP request, check that the connection's TLS server name
+matches the requested authority and apply the hostname's authorization policy.
+
 ## Upstream HTTP/3
 
 For upstream selection, Pingora exposes `Http3Peer` alongside the existing

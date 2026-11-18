@@ -22,6 +22,8 @@ use pingora_core::apps::HttpServerApp;
 use pingora_core::connectors::http::{custom, Connector};
 use pingora_core::protocols::http::subrequest::server::HttpSession as SubrequestSession;
 use pingora_core::protocols::http::{HttpTask, ServerSession};
+use pingora_core::protocols::tls::digest::SslDigest;
+use pingora_core::protocols::Digest;
 use pingora_core::server::ShutdownWatch;
 use pingora_core::upstreams::peer::{Http3Peer, HttpPeer, HttpUpstreamTransport, Peer};
 use pingora_error::{Error, ErrorType, Result};
@@ -32,7 +34,7 @@ use pingora_quic::{
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::oneshot;
 use tokio_quiche::buf_factory::BufFactory;
 use tokio_quiche::http3::driver::{
@@ -367,6 +369,99 @@ pub struct Http3DownstreamSession {
     pub transport: pingora_quic::QuicDownstreamSession,
     /// Number of HTTP/3 requests observed on this downstream session.
     pub requests_seen: u64,
+}
+
+/// Verified client identity from an HTTP/3 connection with optional client authentication.
+pub struct Http3ClientIdentity {
+    /// Server name from the QUIC TLS handshake, when provided.
+    pub server_name: Option<String>,
+    /// Original verified leaf in DER format, when the client presented a certificate.
+    pub certificate: Option<Vec<u8>>,
+}
+
+struct ClientAuthContext(Mutex<Option<boring::ssl::SslContextBuilder>>);
+
+impl tokio_quiche::quic::ConnectionHook for ClientAuthContext {
+    fn create_custom_ssl_context_builder(
+        &self,
+        _settings: tokio_quiche::settings::TlsCertificatePaths<'_>,
+    ) -> Option<boring::ssl::SslContextBuilder> {
+        // This hook is installed on exactly one UDP socket.
+        Some(
+            self.0
+                .lock()
+                .unwrap()
+                .take()
+                .expect("HTTP/3 TLS context already used"),
+        )
+    }
+}
+
+pub(crate) fn client_auth_hooks(
+    config: &pingora_quic::QuicListenerConfig,
+    ca: &std::path::Path,
+) -> Result<tokio_quiche::settings::Hooks> {
+    use boring::ssl::{
+        SslContextBuilder, SslFiletype, SslMethod, SslOptions, SslSessionCacheMode, SslVerifyMode,
+    };
+    let certificate = config
+        .tls_certificate
+        .as_ref()
+        .filter(|cert| cert.kind == pingora_quic::QuicCertificateKind::X509)
+        .ok_or_else(|| {
+            Error::explain(
+                ErrorType::TLSHandshakeFailure,
+                "HTTP/3 client authentication needs X.509 server credentials",
+            )
+        })?;
+    let configure = || -> std::result::Result<_, boring::error::ErrorStack> {
+        let mut context = SslContextBuilder::new(SslMethod::tls())?;
+        context.set_certificate_chain_file(&certificate.cert_path)?;
+        context.set_private_key_file(&certificate.private_key_path, SslFiletype::PEM)?;
+        context.check_private_key()?;
+        context.set_ca_file(ca)?;
+        context.set_verify(SslVerifyMode::PEER);
+        context.set_options(SslOptions::NO_TICKET);
+        context.set_session_cache_mode(SslSessionCacheMode::OFF);
+        Ok(context)
+    };
+    let context = configure().map_err(|error| {
+        Error::because(
+            ErrorType::TLSHandshakeFailure,
+            "configuring HTTP/3 optional client authentication",
+            error,
+        )
+    })?;
+    Ok(tokio_quiche::settings::Hooks {
+        connection_hook: Some(Arc::new(ClientAuthContext(Mutex::new(Some(context))))),
+    })
+}
+
+pub(crate) fn client_auth_digest(
+    conn: &mut tokio_quiche::quic::QuicheConnection,
+) -> Option<SslDigest> {
+    if !conn.is_established() || conn.is_resumed() {
+        return None;
+    }
+    let server_name = conn.server_name().map(str::to_owned);
+    let certificate = conn.peer_cert().map(<[u8]>::to_vec);
+    let ssl = conn.as_mut();
+    if certificate.is_some() && ssl.verify_result().is_err() {
+        return None;
+    }
+    let fingerprint = certificate
+        .as_deref()
+        .map(|cert| boring::sha::sha256(cert).to_vec())
+        .unwrap_or_default();
+    let cipher = ssl.current_cipher()?.name();
+    Some(
+        SslDigest::new(cipher, ssl.version_str(), None, None, fingerprint).with_extension(
+            Http3ClientIdentity {
+                server_name,
+                certificate,
+            },
+        ),
+    )
 }
 
 /// A downstream HTTP/3 request prepared for the proxy phase model.
@@ -901,12 +996,11 @@ pub async fn write_downstream_http3_response(
     Ok(())
 }
 
-/// Process one downstream HTTP/3 request through the standard `HttpProxy` request lifecycle.
-#[allow(dead_code)]
-pub async fn proxy_downstream_http3_request<SV, C>(
-    proxy: std::sync::Arc<HttpProxy<SV, C>>,
+pub(crate) async fn proxy_downstream_http3_request<SV, C>(
+    proxy: Arc<HttpProxy<SV, C>>,
     mut request: Http3DownstreamRequest,
     shutdown: &ShutdownWatch,
+    ssl_digest: Option<Arc<SslDigest>>,
 ) -> Result<()>
 where
     SV: ProxyHttp + Send + Sync + 'static,
@@ -919,8 +1013,14 @@ where
             "downstream HTTP/3 request is missing a response writer",
         )
     })?;
-    let (subrequest, mut handle) =
+    let (mut subrequest, mut handle) =
         SubrequestSession::new_from_request_header(request.request_header.clone());
+    if let Some(ssl_digest) = ssl_digest {
+        subrequest.set_digest(Digest {
+            ssl_digest: Some(ssl_digest),
+            ..Default::default()
+        });
+    }
     let mut body_reader = request.body_reader.take();
     let body_tx = handle.tx.clone();
     let mut wants_body = handle.subreq_wants_body;
@@ -1515,6 +1615,186 @@ mod tests {
             authority: Some("example.com".to_string()),
             headers: vec![("x-test".to_string(), "1".to_string())],
         }
+    }
+
+    #[tokio::test]
+    async fn optional_http3_client_auth_exposes_only_verified_leaf() {
+        use crate::{Http3ClientIdentity, HttpProxy, ProxyHttp};
+        use boring::asn1::Asn1Time;
+        use boring::hash::MessageDigest;
+        use boring::pkey::{PKey, Private};
+        use boring::rsa::Rsa;
+        use boring::x509::{extension, X509Name, X509Ref, X509};
+        use pingora_error::Result;
+        use pingora_quic::{QuicCertificateKind, QuicListenerConfig, QuicTlsCertificate};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn identity(
+            name: &str,
+            issuer: Option<(&X509Ref, &PKey<Private>)>,
+        ) -> (X509, PKey<Private>) {
+            let key = PKey::from_rsa(Rsa::generate(2048).unwrap()).unwrap();
+            let mut subject = X509Name::builder().unwrap();
+            subject.append_entry_by_text("CN", name).unwrap();
+            let subject = subject.build();
+            let mut cert = X509::builder().unwrap();
+            cert.set_version(2).unwrap();
+            cert.set_subject_name(&subject).unwrap();
+            cert.set_issuer_name(issuer.map_or(subject.as_ref(), |(certificate, _)| {
+                certificate.subject_name()
+            }))
+            .unwrap();
+            cert.set_pubkey(&key).unwrap();
+            cert.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+                .unwrap();
+            cert.set_not_after(&Asn1Time::days_from_now(1).unwrap())
+                .unwrap();
+            if issuer.is_some() {
+                cert.append_extension(
+                    &extension::ExtendedKeyUsage::new()
+                        .client_auth()
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            } else {
+                cert.append_extension(
+                    &extension::BasicConstraints::new()
+                        .critical()
+                        .ca()
+                        .build()
+                        .unwrap(),
+                )
+                .unwrap();
+            }
+            cert.sign(
+                issuer.map_or(&key, |(_, signing_key)| signing_key),
+                MessageDigest::sha256(),
+            )
+            .unwrap();
+            (cert.build(), key)
+        }
+
+        struct IdentityProxy {
+            expected_certificate: Vec<u8>,
+            requests: Arc<AtomicUsize>,
+        }
+        #[async_trait::async_trait]
+        impl ProxyHttp for IdentityProxy {
+            type CTX = ();
+            fn new_ctx(&self) {}
+            async fn request_filter(
+                &self,
+                session: &mut crate::Session,
+                _: &mut (),
+            ) -> Result<bool> {
+                self.requests.fetch_add(1, Ordering::Relaxed);
+                let identity = session
+                    .as_downstream()
+                    .digest()
+                    .unwrap()
+                    .ssl_digest
+                    .as_ref()
+                    .unwrap()
+                    .extension
+                    .get::<Http3ClientIdentity>()
+                    .unwrap();
+                assert_eq!(identity.server_name.as_deref(), Some("localhost"));
+                let status = if let Some(certificate) = &identity.certificate {
+                    assert_eq!(*certificate, self.expected_certificate);
+                    200
+                } else {
+                    401
+                };
+                if status == 200 {
+                    let response = Box::new(ResponseHeader::build(200, None)?);
+                    session.write_response_header(response, true).await?;
+                } else {
+                    session.respond_error(status).await?;
+                }
+                Ok(true)
+            }
+            async fn upstream_peer(
+                &self,
+                _: &mut crate::Session,
+                _: &mut (),
+            ) -> Result<Box<HttpPeer>> {
+                panic!("the test responds in the request filter")
+            }
+        }
+
+        let files = tempfile::tempdir().unwrap();
+        let (ca, ca_key) = identity("test client CA", None);
+        let (client, client_key) = identity("test client", Some((&ca, &ca_key)));
+        let (untrusted_ca, untrusted_key) = identity("untrusted client CA", None);
+        let (untrusted_client, untrusted_client_key) =
+            identity("untrusted client", Some((&untrusted_ca, &untrusted_key)));
+        let ca_path = files.path().join("client-ca.pem");
+        std::fs::write(&ca_path, ca.to_pem().unwrap()).unwrap();
+        let client_tls = |name: &str, certificate: &X509, key: &PKey<Private>| {
+            let cert_path = files.path().join(format!("{name}.pem"));
+            let key_path = files.path().join(format!("{name}.key"));
+            std::fs::write(&cert_path, certificate.to_pem().unwrap()).unwrap();
+            std::fs::write(&key_path, key.private_key_to_pem_pkcs8().unwrap()).unwrap();
+            QuicTlsCertificate::new(
+                cert_path.to_str().unwrap(),
+                key_path.to_str().unwrap(),
+                QuicCertificateKind::X509,
+            )
+        };
+        let trusted = client_tls("trusted", &client, &client_key);
+        let untrusted = client_tls("untrusted", &untrusted_client, &untrusted_client_key);
+        let addr = {
+            let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            socket.local_addr().unwrap()
+        };
+        let keys = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/keys");
+        let config = QuicListenerConfig::new("h3 test", SocketAddr::Inet(addr))
+            .with_alpn_protocols(vec![b"h3".to_vec()])
+            .with_tls_certificate(Some(QuicTlsCertificate::new(
+                keys.join("server.crt").to_str().unwrap(),
+                keys.join("key.pem").to_str().unwrap(),
+                QuicCertificateKind::X509,
+            )));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let filter = IdentityProxy {
+            expected_certificate: client.to_der().unwrap(),
+            requests: requests.clone(),
+        };
+        let mut proxy = HttpProxy::new(filter, Arc::default());
+        proxy.handle_init_modules();
+        let (_shutdown, watch) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(crate::HttpProxyService::run_http3_endpoint(
+            Arc::new(proxy),
+            config,
+            Some(ca_path),
+            watch,
+        ));
+        let executor = Http3UpstreamExecutor::new();
+        let peer = upstream_peer(addr.port());
+        for (credential, expected) in [(None, 401), (Some(trusted), 200), (Some(untrusted), 0)] {
+            let connector = executor
+                .connector_config(&peer)
+                .with_client_certificate(credential);
+            let result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                let (session, _) = executor.pool.checkout(&connector).await?;
+                executor
+                    .execute_on_session(&session, &peer, &upstream_request(Method::GET, b"/"))
+                    .await
+            })
+            .await
+            .expect("HTTP/3 request timed out");
+            if expected == 0 {
+                assert!(
+                    result.is_err(),
+                    "an untrusted client certificate reached the proxy"
+                );
+            } else {
+                assert_eq!(result.unwrap().response_header.status.as_u16(), expected);
+            }
+        }
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
+        server.abort();
     }
 
     fn downstream_session() -> QuicDownstreamSession {
