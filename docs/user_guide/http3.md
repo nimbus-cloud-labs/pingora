@@ -79,6 +79,13 @@ Current downstream compatibility is intentionally conservative:
 - generic request and response phases remain reusable
 - HTTP/1.x `Connection` and `Upgrade` semantics are rejected for HTTP/3 requests
 - downstream request bodies are surfaced as explicit HTTP/3 body chunks
+- zero-length application body writes do not emit an HTTP/1.x terminal chunk;
+  the explicit finish operation emits it once, keeping reused upstream connections
+  correctly framed
+- downstream response conversion removes HTTP/1.x connection-specific fields,
+  including every field named by any `Connection` header, as required by
+  [RFC 9114, Section 4.2](https://www.rfc-editor.org/rfc/rfc9114.html#section-4.2);
+  end-to-end fields and repeated values remain intact
 - downstream response headers, body bytes, and response trailers can be written back on real HTTP/3 streams
 - downstream request trailers are not surfaced by the current backend and must be treated as unsupported
 - use `Http3CompatibilityReport` if you need an explicit view of supported phases

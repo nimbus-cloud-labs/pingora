@@ -1287,7 +1287,27 @@ fn response_to_h3_headers(response: &ResponseHeader) -> Vec<H3Header> {
         b":status",
         response.status.as_str().as_bytes(),
     ));
+    // HTTP/1 connection metadata in a subrequest must not cross the HTTP/3 boundary.
+    let connection_options = response
+        .headers
+        .get_all(CONNECTION)
+        .iter()
+        .flat_map(|value| value.as_bytes().split(|byte| *byte == b','))
+        .filter_map(|option| header::HeaderName::from_bytes(option.trim_ascii()).ok())
+        .collect::<Vec<_>>();
     for (name, value) in &response.headers {
+        if matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-connection"
+                | "transfer-encoding"
+                | "upgrade"
+                | "te"
+        ) || connection_options.contains(name)
+        {
+            continue;
+        }
         headers.push(H3Header::new(name.as_str().as_bytes(), value.as_bytes()));
     }
     headers
@@ -1909,6 +1929,56 @@ mod tests {
         assert_eq!(second.data, b"pong");
         assert!(second.fin);
         assert!(body.recv_chunk().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn bridge_omits_connection_specific_response_headers() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut writer = super::Http3ResponseWriter::new(PollSender::new(tx));
+        let mut response = ResponseHeader::build(200, None).unwrap();
+        for (name, value) in [
+            ("content-type", "application/json"),
+            ("content-length", "204"),
+            ("connection", "close, X-Hop"),
+            ("connection", "Keep-Alive, X-Second-Hop"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "keep-alive"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "websocket"),
+            ("te", "trailers"),
+            ("x-hop", "first connection only"),
+            ("x-second-hop", "second connection only"),
+            ("date", "Wed, 18 Nov 2026 09:54:35 GMT"),
+            ("set-cookie", "first=1"),
+            ("set-cookie", "second=2"),
+            ("x-end-to-end", "preserved"),
+        ] {
+            response.append_header(name, value).unwrap();
+        }
+
+        writer.send_response_header(&response).await.unwrap();
+        let OutboundFrame::Headers(headers, _) = rx.recv().await.unwrap() else {
+            panic!("expected response headers");
+        };
+        assert_eq!(headers[0].name(), b":status");
+        let mut actual = headers
+            .iter()
+            .map(|header| (header.name().to_vec(), header.value().to_vec()))
+            .collect::<Vec<_>>();
+        let mut expected = [
+            (":status", "200"),
+            ("content-type", "application/json"),
+            ("content-length", "204"),
+            ("date", "Wed, 18 Nov 2026 09:54:35 GMT"),
+            ("set-cookie", "first=1"),
+            ("set-cookie", "second=2"),
+            ("x-end-to-end", "preserved"),
+        ]
+        .map(|(name, value)| (name.as_bytes().to_vec(), value.as_bytes().to_vec()));
+        actual.sort();
+        expected.sort();
+        assert_eq!(actual, expected);
+        assert_eq!(response.headers.get_all("connection").iter().count(), 2);
     }
 
     #[tokio::test]

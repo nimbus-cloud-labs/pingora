@@ -1386,6 +1386,10 @@ impl BodyWriter {
     {
         match self.body_mode {
             BM::ChunkedEncoding(written) => {
+                // Only finish emits the terminal chunk; empty application writes carry no data.
+                if buf.is_empty() {
+                    return Ok(Some(0));
+                }
                 let chunk_size = buf.len();
 
                 let chuck_size_buf = format!("{:X}\r\n", chunk_size);
@@ -1877,6 +1881,11 @@ impl BodyWriter {
         // Move to Writing state if we're Idle
         if matches!(self.send_body_state.write_state, WriteState::Idle) {
             if let Some(bytes) = self.send_body_state.pending_bytes.take() {
+                if bytes.is_empty() {
+                    self.send_body_state.write_state = WriteState::Done(0);
+                    self.send_body_state.timeout_fut = None;
+                    return Poll::Ready(Ok(Some(0)));
+                }
                 let application_bytes_size = bytes.len();
 
                 // Format the chunk: size\r\ndata\r\n
@@ -3265,6 +3274,38 @@ mod tests {
         let res = body_writer.finish(&mut mock_io).await.unwrap().unwrap();
         assert_eq!(res, 1);
         assert_eq!(body_writer.body_mode, BodyMode::Complete(1));
+    }
+
+    #[tokio::test]
+    async fn chunked_empty_writes_do_not_terminate_body() {
+        for task_api in [false, true] {
+            let mut output = Builder::new()
+                .write(b"5\r\nhello\r\n")
+                .write(&LAST_CHUNK[..])
+                .build();
+            let mut writer = BodyWriter::new();
+            writer.init_chunked();
+
+            for data in [b"".as_slice(), b"hello".as_slice(), b"".as_slice()] {
+                let written = if task_api {
+                    writer.send_body_task(Bytes::copy_from_slice(data), None);
+                    writer.write_current_body_task(&mut output).await.unwrap()
+                } else {
+                    writer.write_body(&mut output, data).await.unwrap()
+                };
+                assert_eq!(written, Some(data.len()));
+                assert!(!writer.finished());
+            }
+
+            let finished = if task_api {
+                writer.send_finish_task();
+                writer.write_current_finish_task(&mut output).await.unwrap()
+            } else {
+                writer.finish(&mut output).await.unwrap()
+            };
+            assert_eq!(finished, Some(5));
+            assert!(writer.finished());
+        }
     }
 
     #[tokio::test]
